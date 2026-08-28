@@ -64,8 +64,8 @@ type Bridge struct {
 	// outage nobody has noticed, and on 2026-08-24 it was the latter for
 	// 24 hours with nothing able to tell the difference. See watchdog.go.
 	disconnectedSince time.Time
-	deviceJID     string
-	lastSyncTime  time.Time
+	deviceJID         string
+	lastSyncTime      time.Time
 
 	// Auth lifecycle surfaced over /api/status + /api/auth/* (see auth.go).
 	authState        AuthState
@@ -113,9 +113,16 @@ func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string, trans
 		client:      client,
 		transcriber: transcriber,
 		rootCtx:     ctx,
-		authState:   AuthStateUnauthenticated,
-		walker:      newBackfillWalker(),
-		fatal:       make(chan struct{}),
+		// Treat "not connected yet" as an outage that started now. Without this
+		// the clock only ever started on an events.Disconnected, so a bridge that
+		// never managed its FIRST connection reported 0 seconds down forever and
+		// the watchdog skipped it entirely — which is exactly what happened on
+		// 2026-08-28, when the logon-triggered task fired before DNS was up.
+		// Cleared on the first successful connect.
+		disconnectedSince: time.Now(),
+		authState:         AuthStateUnauthenticated,
+		walker:            newBackfillWalker(),
+		fatal:             make(chan struct{}),
 	}
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
@@ -144,6 +151,14 @@ func (b *Bridge) Status() (connected, authed bool, deviceJID string, lastSync in
 		ls = b.lastSyncTime.Unix()
 	}
 	return b.connected, b.authenticated, b.deviceJID, ls
+}
+
+// HasDeviceIdentity reports whether this client is paired — whether whatsmeow's
+// store still holds a device. It is the durable fact behind "should this bridge
+// be connected right now", and unlike the `authenticated` flag it is true even
+// before the first successful connection of a run.
+func (b *Bridge) HasDeviceIdentity() bool {
+	return b.client != nil && b.client.Store != nil && b.client.Store.ID != nil
 }
 
 // DisconnectedFor returns how long the WhatsApp socket has been down, or 0
@@ -213,6 +228,23 @@ func (b *Bridge) handleEvent(raw interface{}) {
 		b.mu.Lock()
 		b.connected = true
 		b.disconnectedSince = time.Time{}
+		// Derive authentication from the device identity rather than trusting a
+		// flag someone set once. events.Connected only fires after a successful
+		// handshake, so a client that still has a device identity IS
+		// authenticated at this point — that is what the state means.
+		//
+		// It used to be set in exactly two places, RunAuth's returning-user path
+		// and PairSuccess, neither of which runs on a reconnect. So when RunAuth
+		// failed at startup — 2026-08-28: the logon-triggered task fired before
+		// DNS was up, and web.whatsapp.com did not resolve — `authenticated`
+		// stayed false permanently. IsConnected() is `connected && authenticated`
+		// and gates every send, so once the socket came back the bridge answered
+		// 503 to every send against a perfectly live connection, and no amount of
+		// reconnecting could clear it short of restarting the process.
+		if id := b.client.Store.ID; id != nil {
+			b.authenticated = true
+			b.deviceJID = id.String()
+		}
 		if b.authenticated {
 			b.authState = AuthStatePaired
 		}

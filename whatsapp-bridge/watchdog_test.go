@@ -77,6 +77,40 @@ func TestDisconnectedForReportsDuration(t *testing.T) {
 	}
 }
 
+// TestNeverConnectedCountsAsAnOutage covers the case the first version of this
+// watchdog missed entirely, found the hard way on 2026-08-28.
+//
+// The logon-triggered task fired before DNS was up, so RunAuth's first connect
+// failed with "no such host". No events.Disconnected ever arrived — you cannot
+// disconnect from something you never connected to — so disconnectedSince stayed
+// zero, DisconnectedFor reported 0, and the watchdog skipped the bridge for the
+// next 50 minutes. A bridge with valid credentials that has never once connected
+// is the state most in need of a nudge, and it was the one state excluded.
+func TestNeverConnectedCountsAsAnOutage(t *testing.T) {
+	// What NewBridge now does: the clock starts at construction, not at the
+	// first disconnect event.
+	b := &Bridge{disconnectedSince: time.Now().Add(-10 * time.Minute)}
+
+	got := b.DisconnectedFor()
+	if got == 0 {
+		t.Fatal("a bridge that never connected must report an outage, not 0")
+	}
+	if got < 9*time.Minute {
+		t.Fatalf("DisconnectedFor = %s, want ~10m since startup", got)
+	}
+	if got < watchdogGrace {
+		t.Fatal("ten minutes without a first connection must be past the grace period")
+	}
+
+	// And the first successful connect clears it, so a healthy start reports
+	// nothing rather than "down since boot" forever.
+	b.connected = true
+	b.disconnectedSince = time.Time{}
+	if got := b.DisconnectedFor(); got != 0 {
+		t.Fatalf("after the first connect: DisconnectedFor = %s, want 0", got)
+	}
+}
+
 // TestDisconnectClockStartsOncePerOutage is the subtle one. whatsmeow emits
 // events.Disconnected repeatedly while it retries; if each one reset the clock,
 // the measured duration would never exceed a single retry interval and a

@@ -108,9 +108,18 @@ func (b *Bridge) RunDisconnectionWatchdog(ctx context.Context) {
 		}
 
 		// Only nudge a bridge that HAS a device identity. Without one the right
-		// path is pairing (loginLoop), not reconnection, and calling Connect
-		// here would fight it for the socket.
-		if _, authed, _, _ := b.Status(); !authed {
+		// path is pairing (loginLoop), not reconnection, and calling Connect here
+		// would fight it for the socket.
+		//
+		// Keyed on the identity itself, NOT on the `authenticated` flag. That
+		// flag is only true once a connection has already succeeded, so gating on
+		// it made the watchdog useless in the one case it most needed to act: a
+		// bridge that has valid credentials but has never managed to connect at
+		// all. On 2026-08-28 that is precisely what happened — startup raced DNS,
+		// the first connect failed, and the watchdog then skipped the bridge for
+		// the next 50 minutes because a flag that only a successful connection
+		// can set had never been set.
+		if !b.HasDeviceIdentity() {
 			continue
 		}
 
