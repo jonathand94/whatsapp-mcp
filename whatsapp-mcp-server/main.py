@@ -92,13 +92,31 @@ async def lifespan(_app: FastMCP):
         timeout=httpx.Timeout(30.0, connect=5.0),
     )
     try:
-        # Preflight: confirm the Go bridge is reachable.
+        # Preflight: confirm the Go bridge is reachable. It is informational
+        # only — a failure is logged and startup continues — so it has to be
+        # cheap and bounded, because nothing is served until this yields.
+        #
+        # It used to call /healthcheck, which walks the whole message database.
+        # After a reboot, with a cold cache, that took 32 s on 2026-09-29, and
+        # this preflight waited out its full 30 s timeout before yielding. Every
+        # new MCP client gave up first: Claude Code's connect timeout is 30 s,
+        # so each new session failed with CONNECT_TIMEOUT. The HTTP server runs
+        # this lifespan twice, so it paid the 30 s twice.
+        #
+        # /api/status answers in milliseconds and reports what matters here:
+        # whether WhatsApp itself is connected and paired.
         try:
-            r = await _http.get("/healthcheck")
+            r = await _http.get("/api/status", timeout=5.0)
             r.raise_for_status()
-            log.info("bridge healthcheck OK: %s", r.json())
+            s = r.json()
+            log.info(
+                "bridge reachable: connected=%s authenticated=%s auth_state=%s",
+                s.get("connected"), s.get("authenticated"), s.get("auth_state"),
+            )
         except Exception as e:  # noqa: BLE001
-            log.warning("bridge healthcheck failed: %s (continuing; tools will error at call time)", e)
+            # %r, not %s: str() of an httpx timeout is empty, which logged
+            # "failed:  (continuing" with no hint of what went wrong.
+            log.warning("bridge preflight failed: %r (continuing; tools will error at call time)", e)
         yield
     finally:
         if _http is not None:
