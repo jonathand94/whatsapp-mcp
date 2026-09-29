@@ -58,6 +58,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/auth/reconnect", s.handleAuthReconnect)
 
 	s.mux.HandleFunc("GET /api/chats", s.handleListChats)
+	s.mux.HandleFunc("GET /api/calls", s.handleListCalls)
 	s.mux.HandleFunc("GET /api/messages", s.handleListMessages)
 	s.mux.HandleFunc("GET /api/contacts/search", s.handleSearchContacts)
 	s.mux.HandleFunc("GET /api/groups", s.handleListGroups)

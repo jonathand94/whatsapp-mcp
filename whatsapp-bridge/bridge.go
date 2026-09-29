@@ -317,10 +317,35 @@ func (b *Bridge) handleEvent(raw interface{}) {
 		// The user renamed someone in their address book on another device.
 		// Without this the new label waits for the next restart's sync sweep.
 		b.onContactUpdate(evt)
+	// Calls: see calls.go. Every event upserts, so whichever arrives first
+	// creates the row and a missed offer no longer loses the whole call.
 	case *events.CallOffer:
-		b.onCallOffer(evt)
+		e := b.callEventFrom(evt.BasicCallMeta)
+		e.IsVideo = offerIsVideo(evt.Data)
+		b.onCallEvent(e)
+	case *events.CallOfferNotice:
+		// Group calls and calls this device cannot take arrive as a notice,
+		// which states the media type and group-ness outright.
+		e := b.callEventFrom(evt.BasicCallMeta)
+		e.IsVideo = evt.Media == "video"
+		e.IsGroup = e.IsGroup || evt.Type == "group"
+		b.onCallEvent(e)
+	case *events.CallAccept:
+		e := b.callEventFrom(evt.BasicCallMeta)
+		e.Result, e.Definitive = callAnswered, true
+		b.onCallEvent(e)
+	case *events.CallReject:
+		e := b.callEventFrom(evt.BasicCallMeta)
+		e.Result, e.Definitive = callRejected, true
+		b.onCallEvent(e)
 	case *events.CallTerminate:
-		b.onCallTerminate(evt)
+		e := b.callEventFrom(evt.BasicCallMeta)
+		result, known := mapTerminateReason(evt.Reason)
+		if !known {
+			log.Printf("calls: unrecognized terminate reason %q on %s; recorded as %q", evt.Reason, evt.CallID, result)
+		}
+		e.Result = result
+		b.onCallEvent(e)
 	case *events.JoinedGroup:
 		// Record the group's real subject + participant count the moment we
 		// join, so a group born mid-session never sits nameless (or worse,
@@ -521,37 +546,6 @@ func (b *Bridge) onReceipt(evt *events.Receipt) {
 	// Receipts are informational for now; we log them but don't alter state.
 	// Future: update read-status on message rows if useful for list_messages output.
 	_ = evt
-}
-
-func (b *Bridge) onCallOffer(evt *events.CallOffer) {
-	if !b.cfg.CaptureCalls {
-		return
-	}
-	chatJID := evt.CallCreator.String()
-	_, err := b.db.Exec(`
-		INSERT INTO calls (id, chat_jid, caller_jid, timestamp, call_type, is_group, is_outbound, result)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO NOTHING
-	`, evt.CallID, chatJID, evt.CallCreator.String(), evt.Timestamp.Unix(), "voice", 0, 0, "offered")
-	if err != nil {
-		log.Printf("onCallOffer: insert failed: %v", err)
-	}
-}
-
-func (b *Bridge) onCallTerminate(evt *events.CallTerminate) {
-	if !b.cfg.CaptureCalls {
-		return
-	}
-	result := strings.ToLower(string(evt.Reason))
-	if result == "" {
-		result = "ended"
-	}
-	_, err := b.db.Exec(`
-		UPDATE calls SET result = ? WHERE id = ?
-	`, result, evt.CallID)
-	if err != nil {
-		log.Printf("onCallTerminate: update failed: %v", err)
-	}
 }
 
 // --- Helpers ---------------------------------------------------------------
