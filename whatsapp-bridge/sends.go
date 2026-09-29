@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -310,6 +311,39 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	recipient, err := types.ParseJID(recipientJID)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid recipient JID", Details: err.Error()})
+		return
+	}
+
+	// The rate limit is enforced HERE, and the position is the whole point: the
+	// recipient is known, but the message has not been built, no media has been
+	// uploaded, and — critically — the draft has not yet flipped to 'confirmed'.
+	//
+	// Refusing after that flip would strand the draft in a state that
+	// ReconcileInFlightSends later reports with "DELIVERY IS UNKNOWN — check the
+	// chat in WhatsApp before resending", sending someone to look for a message
+	// that was never sent. Refusing here leaves the draft in 'draft', reusable
+	// once the window clears.
+	isNewChat, classifyErr := s.chatHasNoInbound(r.Context(), recipientJID)
+	if classifyErr != nil {
+		// Fail closed. The draft was read from this same database moments ago,
+		// so a failure here is genuinely exceptional — and guessing "not new"
+		// would spend the protection this check exists to provide.
+		log.Printf("send blocked draft=%s: cannot classify recipient %s: %v", draftID, recipientJID, classifyErr)
+		writeJSON(w, http.StatusInternalServerError, errorResponse{
+			Error:   "cannot classify recipient",
+			Details: "refusing to send without knowing whether this is a first contact: " + classifyErr.Error(),
+		})
+		return
+	}
+	if d := s.sendGov().Authorize(recipientJID, isNewChat, time.Now()); !d.Allow {
+		log.Printf("send throttled draft=%s recipient=%s new_chat=%t: %s", draftID, recipientJID, isNewChat, d.Reason)
+		if d.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(d.RetryAfter.Seconds())+1))
+		}
+		writeJSON(w, http.StatusTooManyRequests, errorResponse{
+			Error:   "send rate limit",
+			Details: d.Reason + ". The draft was not consumed and can be confirmed again later.",
+		})
 		return
 	}
 

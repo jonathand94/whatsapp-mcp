@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,11 @@ type Server struct {
 	backfiller *TranscriptBackfiller
 	mux        *http.ServeMux
 	server     *http.Server
+
+	// Outbound rate limiting. Always reached through s.sendGov(), never as a
+	// bare field read — see the note on that method for why.
+	governor *sendGovernor
+	govOnce  sync.Once
 }
 
 func NewServer(cfg *Config, db *sql.DB, bridge *Bridge, backfiller *TranscriptBackfiller) *Server {
@@ -349,6 +355,12 @@ type statusResponse struct {
 	QRExpiresAt        int64  `json:"qr_expires_at,omitempty"`
 	PairingCodePending bool   `json:"pairing_code_pending,omitempty"`
 	LoggedOutReason    string `json:"logged_out_reason,omitempty"`
+
+	// SendBudget is the outbound rate-limit consumption (see pacing.go).
+	// Reported here so a caller can see how close the ceiling is BEFORE a send
+	// is refused, rather than discovering the limits only through the 429 that
+	// announces them. An agent that can read this can also pace itself.
+	SendBudget map[string]any `json:"send_budget,omitempty"`
 	// DisconnectedSeconds is how long the WhatsApp socket has been down, absent
 	// while it is up. `connected: false` on its own cannot distinguish a
 	// two-second blip from the 24-hour outage of 2026-08-24, and an AI agent
@@ -373,6 +385,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		AuthState:          string(snap.State),
 		PairingCodePending: snap.PairingCode != "",
 		LoggedOutReason:    snap.LoggedOutReason,
+		SendBudget:         s.sendGov().Snapshot(time.Now()),
 	}
 	if !snap.QRExpiresAt.IsZero() && snap.QRCode != "" {
 		resp.QRExpiresAt = snap.QRExpiresAt.Unix()
