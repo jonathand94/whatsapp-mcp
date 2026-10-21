@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Media downloaded on another machine was fetched from WhatsApp again, and old files failed.** After moving the bridge from Windows to Linux, `media_path` still pointed at `C:\Users\...`, so the fast path missed and the bridge asked WhatsApp for the bytes — which answers 404/410 for older media. Three of the download failures in the deployment's audit log were files already on disk. `DownloadMediaFile` now looks for the message's file in the media folder by stem (the extension depends on the OS that downloaded it: `.jfif`, `.dtsconfig`) and repoints the row.
+- **Expired media is recovered from the phone.** A 403/404/410 from the CDN now triggers a media retry receipt (`SendMediaRetryReceipt`), and the download continues with the fresh direct path the phone sends back. When the phone is offline or no longer has the file, the error says so (HTTP 410) instead of a bare status code.
+- **A large media send could report failure after it had been delivered.** Confirm ran the upload inside the HTTP request, and the server's 60 s `WriteTimeout` fired first — the message went out with nobody left to tell, the caller saw an error, and the obvious next step was sending it again. Uploads now run as jobs detached from the request (see Added).
+- **History-sync documents with a caption, and media in disappearing chats, had no media keys.** The history path extracted media fields without unwrapping envelopes (the live path gets them unwrapped by whatsmeow), so those rows were typed `document` but could never be downloaded. Both paths now share one extractor that unwraps first.
+
+### Changed
+
+- **Files up to WhatsApp's 2 GB document limit, without holding them in memory.** Downloads stream to disk (`DownloadToFile`), uploads encrypt from disk to disk (`UploadReader`), and `file_path`/`file_url` drafts copy in streaming fashion. The document cap goes from 100 MiB to 2 GB.
+- **Photos and audio over 16 MiB, and videos over 100 MiB, are sent as documents instead of being refused.** Videos keep the 100 MiB they effectively had before, so nothing that used to play inline now arrives as a file. The planned envelope is decided at draft time, stored on the row, and explained in the draft's `note`/`delivered_as` so the user approves what will actually be sent. A voice note, which has no document form, is the one case still refused (after transcoding).
+- **Confirm is idempotent.** A large send answers 202 and the caller confirms again to learn the outcome, so confirming a draft that was already sent now returns that delivery (200, same `whatsapp_message_id`) instead of 409 "create a new draft to retry" — the answer that invited sending the same file twice. A failed draft says why; a draft whose preparation failed returns the reason instead of 404. `confirm_send` in main.py re-confirms for up to 30 s while an upload runs.
+- A finished upload waits up to 2 minutes for WhatsApp to reconnect before sending, and otherwise leaves the draft a draft; a send that does fail frees the draft's file.
+- Media the phone could not supply this time (offline, no answer) is 503, kept apart from media it no longer has (410), so a temporary failure is not reported as permanent.
+- `file_path` must be a regular file and is copied with a byte limit (`/dev/zero` or a FIFO used to fill the disk or hang the draft).
+- Google Drive `file_url`s carry `confirm=t`, skipping the virus-scan interstitial Drive shows for files over ~100 MB.
+- `file_url` downloads have no 3-minute ceiling any more; a download that stops moving for 3 minutes is abandoned instead, counting from the first byte.
+- A download that fails midway starts over from an empty file, up to 3 times. whatsmeow's own retries rewrite the file without truncating it, and its fallback to another CDN host does not rewind at all, so an interrupted large download used to end in an integrity error.
+
+### Added
+
+- **Long media work runs as jobs** (`jobs.go`). `POST /api/media/download`, media drafts and media confirms answer within `?wait=` seconds (default 20, max 25): 200 with the result as before, or 202 with progress. Calling the download or confirm endpoint again joins the running job — a second confirm can never start a second upload.
+- `GET /api/sends/{draft_id}`: a draft's state (`preparing`, `draft`, `uploading`, `sent`, `failed`, `expired`, `rejected`), with progress while a job runs and the reason when a confirm's upload failed.
+- `messages.media_filename` (migration 007): the name a document was sent with, captured on receive, on history sync and on send. `POST /api/media/download` now also returns `filename` (original, or generated like `Imagen 2026-10-21 12.34.56.jpg`), chat, sender and timestamp.
+- Abandoned drafts are swept (`outbound_sweep.go`): at startup the previous run's partial and scratch files are deleted before the API serves, and every hour drafts past their hour are marked expired and their files freed. With drafts of up to 2 GB, a few abandoned ones would otherwise fill the disk the message database lives on.
+
 ## [0.4.0] - 2026-08-19
 
 ### Fixed

@@ -532,6 +532,11 @@ async def send_message(recipient_jid: str, text: str) -> dict[str, Any]:
         raise
 
 
+# How long confirm_send keeps waiting on a large upload before handing back its
+# progress. claude.ai gives a tool call about a minute.
+CONFIRM_BUDGET_S = 30
+
+
 @mcp.tool()
 async def confirm_send(draft_id: str) -> dict[str, Any]:
     """Commit a previously-drafted send. This is where the actual WhatsApp network
@@ -544,15 +549,29 @@ async def confirm_send(draft_id: str) -> dict[str, Any]:
     persisted into the local message database so it shows up in list_messages
     for the recipient chat.
 
+    A large file can still be uploading when this returns (status
+    "uploading"). Call confirm_send again with the same draft_id: it joins the
+    running upload instead of starting another, and once the message is out
+    it returns the same success the first call would have. Never create a new
+    draft to "retry" an upload that is still running or already went out.
+
     Errors:
         404: draft not found
-        409: draft already confirmed/sent/failed (each draft can only be confirmed once)
+        409: draft already confirmed or failed (the error says which, and what to do)
         410: draft expired (>1 hour since creation)
         502: send failed at whatsmeow layer (bridge disconnected, invalid recipient, etc.)
     """
     start = time.time()
     try:
         result = await _bridge_post(f"/api/sends/{draft_id}/confirm", {})
+        # A large upload answers 202 "uploading" once the bridge's own wait is
+        # up. Re-confirming joins that upload and, after it, returns the
+        # delivery, so keep asking for as long as one tool call can safely take.
+        while result.get("status") == "uploading":
+            left = CONFIRM_BUDGET_S - (time.time() - start)
+            if left < 3:
+                break
+            result = await _bridge_post(f"/api/sends/{draft_id}/confirm?wait={int(left) - 1}", {})
         _audit("confirm_send", {"draft_id": draft_id},
                f"status={result.get('status')} whatsapp_id={result.get('whatsapp_message_id')}",
                int((time.time() - start) * 1000))

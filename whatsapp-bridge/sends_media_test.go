@@ -36,26 +36,31 @@ func TestPickMediaType(t *testing.T) {
 		sendType   string
 		mime       string
 		asDocument bool
+		voiceNote  bool
 		want       whatsmeow.MediaType
 	}{
-		{"image goes as photo by default", "file", "image/jpeg", false, whatsmeow.MediaImage},
-		{"image forced to document", "file", "image/jpeg", true, whatsmeow.MediaDocument},
-		{"video goes as video", "file", "video/mp4", false, whatsmeow.MediaVideo},
-		{"video forced to document", "file", "video/mp4", true, whatsmeow.MediaDocument},
-		{"pdf is a document", "file", "application/pdf", false, whatsmeow.MediaDocument},
-		{"unknown type falls back to document", "file", "application/octet-stream", false, whatsmeow.MediaDocument},
-		{"audio ignores mime", "audio", "audio/mpeg", false, whatsmeow.MediaAudio},
-		// as_document is rejected for audio at the validator, but the mapping
-		// must still not silently turn a voice note into a document if it
-		// ever slipped through.
-		{"audio ignores as_document", "audio", "audio/ogg", true, whatsmeow.MediaAudio},
-		{"empty mime is a document", "file", "", false, whatsmeow.MediaDocument},
+		{"image goes as photo by default", "file", "image/jpeg", false, false, whatsmeow.MediaImage},
+		{"image forced to document", "file", "image/jpeg", true, false, whatsmeow.MediaDocument},
+		{"video goes as video", "file", "video/mp4", false, false, whatsmeow.MediaVideo},
+		{"video forced to document", "file", "video/mp4", true, false, whatsmeow.MediaDocument},
+		{"pdf is a document", "file", "application/pdf", false, false, whatsmeow.MediaDocument},
+		{"unknown type falls back to document", "file", "application/octet-stream", false, false, whatsmeow.MediaDocument},
+		{"audio ignores mime", "audio", "audio/mpeg", false, false, whatsmeow.MediaAudio},
+		// An audio file over the native ceiling is stored with as_document
+		// set (planDelivery), and has to actually go as a document.
+		{"oversize audio goes as a document", "audio", "audio/mpeg", true, false, whatsmeow.MediaDocument},
+		// A voice note only exists as audio. as_document is rejected for audio
+		// at the validator and planDelivery never sets it for a voice note, but
+		// the mapping must still not turn one into a document if it slipped
+		// through.
+		{"voice note ignores as_document", "audio", "audio/ogg", true, true, whatsmeow.MediaAudio},
+		{"empty mime is a document", "file", "", false, false, whatsmeow.MediaDocument},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pickMediaType(tc.sendType, tc.mime, tc.asDocument); got != tc.want {
-				t.Fatalf("pickMediaType(%q,%q,%v) = %q, want %q",
-					tc.sendType, tc.mime, tc.asDocument, got, tc.want)
+			if got := pickMediaType(tc.sendType, tc.mime, tc.asDocument, tc.voiceNote); got != tc.want {
+				t.Fatalf("pickMediaType(%q,%q,%v,%v) = %q, want %q",
+					tc.sendType, tc.mime, tc.asDocument, tc.voiceNote, got, tc.want)
 			}
 		})
 	}
@@ -83,39 +88,81 @@ func TestResolveMIMEPrecedence(t *testing.T) {
 	}
 }
 
-// --- checkSizeLimit ---------------------------------------------------------
+// --- planDelivery -----------------------------------------------------------
 
-func TestCheckSizeLimit(t *testing.T) {
+func TestPlanDelivery(t *testing.T) {
+	const native = maxNativeMediaBytes
 	tests := []struct {
-		name     string
-		sendType string
-		mime     string
-		size     int
-		wantErr  bool
+		name       string
+		sendType   string
+		mime       string
+		size       int64
+		asDocument bool
+		voiceNote  bool
+		want       delivery
+		wantErr    bool
 	}{
-		{"small image ok", "file", "image/jpeg", 1024, false},
-		{"image at the limit ok", "file", "image/jpeg", maxImageBytes, false},
-		{"image over the limit", "file", "image/jpeg", maxImageBytes + 1, true},
-		{"document may exceed the image limit", "file", "application/pdf", maxImageBytes + 1, false},
-		{"document at the limit ok", "file", "application/pdf", maxDocumentBytes, false},
-		{"document over the limit", "file", "application/pdf", maxDocumentBytes + 1, true},
-		{"audio over the limit", "audio", "audio/mpeg", maxAudioBytes + 1, true},
-		// An image sent as a document is checked against the image ceiling
-		// here because the limit is chosen from the MIME type. Documented as
-		// deliberate: WhatsApp applies the stricter ceiling to image content
-		// regardless of the envelope.
-		{"image bytes as document still image-limited", "file", "image/png", maxImageBytes + 1, true},
+		{"small photo stays a photo", "file", "image/jpeg", 1024, false, false, delivery{}, false},
+		{"photo at the native ceiling stays a photo", "file", "image/jpeg", native, false, false, delivery{}, false},
+		// The old rule refused this outright. WhatsApp takes the same bytes as
+		// a document, so that is what happens, and the preview says why.
+		{"photo over the native ceiling goes as a document", "file", "image/jpeg", native + 1, false, false,
+			delivery{AsDocument: true, Downgraded: true}, false},
+		// Videos keep the 100 MiB they always had here: one that used to play
+		// inline must not start arriving as a file.
+		{"90 MB video stays a video", "file", "video/mp4", 90 << 20, false, false, delivery{}, false},
+		{"video over its native ceiling goes as a document", "file", "video/mp4", maxNativeVideoBytes + 1, false, false,
+			delivery{AsDocument: true, Downgraded: true}, false},
+		{"audio over the native ceiling goes as a document", "audio", "audio/mpeg", native + 1, false, false,
+			delivery{AsDocument: true, Downgraded: true}, false},
+		// Asked for, so not a downgrade: the preview has nothing to explain.
+		{"explicit document is not a downgrade", "file", "image/png", native + 1, true, false,
+			delivery{AsDocument: true}, false},
+		{"pdf stays an ordinary document", "file", "application/pdf", 1_500_000_000, false, false, delivery{}, false},
+		{"document at WhatsApp's ceiling is accepted", "file", "application/zip", maxDocumentBytes, false, false, delivery{}, false},
+		{"anything over WhatsApp's ceiling is refused", "file", "application/zip", maxDocumentBytes + 1, false, false, delivery{}, true},
+		{"even as an explicit document", "file", "video/mp4", maxDocumentBytes + 1, true, false, delivery{}, true},
+		// A voice note cannot fall back to a document.
+		{"oversize opus voice note is refused", "audio", "audio/ogg", native + 1, false, true, delivery{}, true},
+		// mp3 is transcoded at confirm, which shrinks it; the real check happens
+		// on the converted file.
+		{"oversize mp3 voice note waits for the transcode", "audio", "audio/mpeg", native + 1, false, true, delivery{}, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkSizeLimit(tc.sendType, tc.mime, tc.size)
-			if tc.wantErr && err == nil {
-				t.Fatalf("expected an error for size %d", tc.size)
+			got, err := planDelivery(tc.sendType, tc.mime, tc.size, tc.asDocument, tc.voiceNote)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error for %d bytes", tc.size)
+				}
+				if !strings.Contains(err.Error(), "WhatsApp") {
+					t.Fatalf("the error should say the limit is WhatsApp's: %v", err)
+				}
+				return
 			}
-			if !tc.wantErr && err != nil {
+			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
+			if got != tc.want {
+				t.Fatalf("planDelivery = %+v, want %+v", got, tc.want)
+			}
 		})
+	}
+}
+
+func TestHumanBytes(t *testing.T) {
+	for _, tc := range []struct {
+		n    int64
+		want string
+	}{
+		{999, "999 B"},
+		{1000, "1.0 kB"},
+		{16 << 20, "16.8 MB"},
+		{maxDocumentBytes, "2.0 GB"},
+	} {
+		if got := humanBytes(tc.n); got != tc.want {
+			t.Fatalf("humanBytes(%d) = %q, want %q", tc.n, got, tc.want)
+		}
 	}
 }
 
@@ -260,21 +307,96 @@ func TestMaterializeRejectsEmptyFile(t *testing.T) {
 	}
 }
 
-func TestMaterializeEnforcesSizeLimit(t *testing.T) {
+func TestMaterializeSendsOversizeImageAsDocument(t *testing.T) {
 	cfg := testConfig(t)
-	// Declared as an image so the 16 MiB ceiling applies rather than the
-	// document one, keeping the allocation modest.
-	big := make([]byte, maxImageBytes+1)
-	_, err := materializeOutboundFile(t.Context(), cfg, "d", createDraftRequest{
+	// One byte past the native ceiling: big enough to be downgraded, small
+	// enough to keep the test's allocation modest.
+	big := make([]byte, maxNativeMediaBytes+1)
+	copy(big, tinyPNG)
+	got, err := materializeOutboundFile(t.Context(), cfg, "d", createDraftRequest{
 		SendType:   "file",
 		FileBase64: base64.StdEncoding.EncodeToString(big),
 		Filename:   "huge.jpg",
 	})
+	if err != nil {
+		t.Fatalf("an oversize photo should be accepted as a document, got %v", err)
+	}
+	if !got.AsDocument || !got.Downgraded {
+		t.Fatalf("delivery = %+v, want a size-forced document", got.delivery)
+	}
+	if got.Size != int64(len(big)) {
+		t.Fatalf("size = %d, want %d", got.Size, len(big))
+	}
+	if as := deliveredAs("file", got.MIME, got.delivery, false); as != "document" {
+		t.Fatalf("deliveredAs = %q, want document", as)
+	}
+}
+
+func TestMaterializeRefusesFilesOverWhatsAppsCeiling(t *testing.T) {
+	cfg := testConfig(t)
+	// A sparse file: it reports 2 GB + 1 byte without occupying it, so the
+	// test proves the refusal happens before any copying starts.
+	src := filepath.Join(t.TempDir(), "backup.zip")
+	f, err := os.Create(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxDocumentBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	_, err = materializeOutboundFile(t.Context(), cfg, "d", createDraftRequest{
+		SendType: "file",
+		FilePath: src,
+	})
 	if err == nil {
-		t.Fatal("expected the size limit to reject this")
+		t.Fatal("expected a file over 2 GB to be refused")
 	}
 	if !strings.Contains(err.Error(), "WhatsApp") {
 		t.Fatalf("the error should explain the limit is WhatsApp's: %v", err)
+	}
+	if entries, err := os.ReadDir(outboundDir(cfg)); err == nil && len(entries) != 0 {
+		t.Fatalf("a refused draft left %d file(s) behind", len(entries))
+	}
+}
+
+func TestMaterializeStreamsLargeFilesFromPath(t *testing.T) {
+	cfg := testConfig(t)
+	// Past both the old 100 MiB document cap and the native ceiling, written
+	// sparse so it costs no disk. Copying it is the streaming path the old
+	// os.ReadFile implementation could not take for a 2 GB file.
+	src := filepath.Join(t.TempDir(), "video.mp4")
+	f, err := os.Create(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const size = 120 << 20
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	job := &mediaJob{done: make(chan struct{})}
+	got, err := materializeWithProgress(t.Context(), cfg, "draft-big", createDraftRequest{
+		SendType: "file",
+		FilePath: src,
+	}, job)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Size != size || job.bytesDone.Load() != size || job.bytesTotal.Load() != size {
+		t.Fatalf("size=%d progress=%d/%d, want all %d",
+			got.Size, job.bytesDone.Load(), job.bytesTotal.Load(), size)
+	}
+	if got.MIME != "video/mp4" || !got.AsDocument || !got.Downgraded {
+		t.Fatalf("got %+v, want a video/mp4 forced to document", got)
+	}
+	if st, err := os.Stat(got.Path); err != nil || st.Size() != size {
+		t.Fatalf("copied file: %v (size %v)", err, st)
+	}
+	if _, err := os.Stat(filepath.Join(outboundDir(cfg), "draft-big.part")); !os.IsNotExist(err) {
+		t.Fatalf("the .part file should be gone after a successful draft, stat err = %v", err)
 	}
 }
 

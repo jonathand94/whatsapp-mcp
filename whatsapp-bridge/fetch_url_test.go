@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -43,6 +45,19 @@ func testFetcher(t *testing.T, srv *httptest.Server) fetcher {
 	}
 }
 
+// fetchToMemory runs fetchRemoteFileTo into a buffer. Downloads stream to disk
+// now; these tests were written against the in-memory shape, and what they
+// check — the guard, the HTML refusal, the caps, the naming — is the same
+// either way.
+func fetchToMemory(ctx context.Context, rawURL string, maxBytes int64, f fetcher) ([]byte, string, error) {
+	var buf bytes.Buffer
+	name, _, err := fetchRemoteFileTo(ctx, rawURL, maxBytes, f, &buf, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), name, nil
+}
+
 // --- the redirect guard -----------------------------------------------------
 
 // TestRedirectToInstanceMetadataIsBlockedAtTheHop is the test this feature
@@ -68,7 +83,7 @@ func TestRedirectToInstanceMetadataIsBlockedAtTheHop(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			_, _, err := fetchRemoteFile(t.Context(), srv.URL+"/photo.png", 1<<20, testFetcher(t, srv))
+			_, _, err := fetchToMemory(t.Context(), srv.URL+"/photo.png", 1<<20, testFetcher(t, srv))
 			if err == nil {
 				t.Fatal("a redirect to an internal address must not be followed")
 			}
@@ -135,7 +150,7 @@ func TestRedirectLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := fetchRemoteFile(t.Context(), srv.URL+"/start", 1<<20, testFetcher(t, srv))
+	_, _, err := fetchToMemory(t.Context(), srv.URL+"/start", 1<<20, testFetcher(t, srv))
 	if err == nil {
 		t.Fatal("an endless redirect chain must be refused")
 	}
@@ -242,7 +257,7 @@ func TestGuardedDialRefusesNamesThatResolveInward(t *testing.T) {
 
 func TestNormalizeDriveURL(t *testing.T) {
 	const id = "1vlfw7ItHujtl5F2XuHHImg-v25XycGpD"
-	direct := "https://drive.usercontent.google.com/download?id=" + id + "&export=download"
+	direct := "https://drive.usercontent.google.com/download?id=" + id + "&export=download&confirm=t"
 
 	tests := []struct {
 		name, in, want string
@@ -288,7 +303,7 @@ func TestFetchRemoteFileDownloads(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	data, name, err := fetchRemoteFile(t.Context(), srv.URL+"/download", maxDocumentBytes, testFetcher(t, srv))
+	data, name, err := fetchToMemory(t.Context(), srv.URL+"/download", maxDocumentBytes, testFetcher(t, srv))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -315,7 +330,7 @@ func TestFetchRemoteFileRejectsHTML(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		_, _, err := fetchRemoteFile(t.Context(), srv.URL+"/file", 1<<20, testFetcher(t, srv))
+		_, _, err := fetchToMemory(t.Context(), srv.URL+"/file", 1<<20, testFetcher(t, srv))
 		if !errors.Is(err, errHTMLBody) {
 			t.Fatalf("an HTML body must be refused, got %v", err)
 		}
@@ -334,7 +349,7 @@ func TestFetchRemoteFileRejectsHTML(t *testing.T) {
 
 		// Sniffing the body is what keeps the check from being sidestepped by
 		// simply not declaring a type.
-		_, _, err := fetchRemoteFile(t.Context(), srv.URL+"/file", 1<<20, testFetcher(t, srv))
+		_, _, err := fetchToMemory(t.Context(), srv.URL+"/file", 1<<20, testFetcher(t, srv))
 		if !errors.Is(err, errHTMLBody) {
 			t.Fatalf("an undeclared HTML body must still be refused, got %v", err)
 		}
@@ -354,7 +369,7 @@ func TestFetchRemoteFileCapsStreamWhenLengthIsUnknown(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := fetchRemoteFile(t.Context(), srv.URL+"/big.pdf", ceiling, testFetcher(t, srv))
+	_, _, err := fetchToMemory(t.Context(), srv.URL+"/big.pdf", ceiling, testFetcher(t, srv))
 	if err == nil {
 		t.Fatal("a body over the ceiling must be refused even with no Content-Length")
 	}
@@ -374,7 +389,7 @@ func TestFetchRemoteFileRejectsDeclaredOversize(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := fetchRemoteFile(t.Context(), srv.URL+"/big.pdf", 1<<10, testFetcher(t, srv))
+	_, _, err := fetchToMemory(t.Context(), srv.URL+"/big.pdf", 1<<10, testFetcher(t, srv))
 	if err == nil {
 		t.Fatal("a declared oversize body must be refused")
 	}
@@ -390,7 +405,7 @@ func TestFetchRemoteFileRejectsBadStatusAndEmptyBody(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		if _, _, err := fetchRemoteFile(t.Context(), srv.URL+"/x", 1<<20, testFetcher(t, srv)); err == nil {
+		if _, _, err := fetchToMemory(t.Context(), srv.URL+"/x", 1<<20, testFetcher(t, srv)); err == nil {
 			t.Fatal("a 404 must not become a draft")
 		}
 	})
@@ -404,7 +419,7 @@ func TestFetchRemoteFileRejectsBadStatusAndEmptyBody(t *testing.T) {
 
 		// An empty file uploads "successfully" and arrives as an unopenable
 		// attachment, same as the file_path case.
-		if _, _, err := fetchRemoteFile(t.Context(), srv.URL+"/x", 1<<20, testFetcher(t, srv)); err == nil {
+		if _, _, err := fetchToMemory(t.Context(), srv.URL+"/x", 1<<20, testFetcher(t, srv)); err == nil {
 			t.Fatal("an empty download must be refused")
 		}
 	})
@@ -449,17 +464,6 @@ func TestFetchNameHint(t *testing.T) {
 }
 
 // --- wiring into the draft flow ---------------------------------------------
-
-func TestFetchCeiling(t *testing.T) {
-	// The ceiling is picked before the content type is known, so it is the most
-	// permissive limit that could apply. checkSizeLimit narrows it afterwards.
-	if got := fetchCeiling("audio"); got != maxAudioBytes {
-		t.Fatalf("audio ceiling = %d, want %d", got, maxAudioBytes)
-	}
-	if got := fetchCeiling("file"); got != maxDocumentBytes {
-		t.Fatalf("file ceiling = %d, want %d", got, maxDocumentBytes)
-	}
-}
 
 func TestMaterializeRefusesBlockedURL(t *testing.T) {
 	cfg := testConfig(t)

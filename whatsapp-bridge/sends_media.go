@@ -23,6 +23,12 @@
 //     There is no periodic sweeper. That path leaks one file per abandoned
 //     draft, unlike the send path, which used to leak one per message sent.
 //
+// Files of any size up to WhatsApp's own ceiling move through here without
+// ever being held in memory: drafts are copied or downloaded straight to disk,
+// and confirm encrypts from disk to disk and uploads from there. Until
+// 2026-10 every input was read into a byte slice first, and documents were
+// capped at 100 MiB, a twentieth of what WhatsApp accepts.
+//
 // Voice notes are the one place a plain file is not enough: WhatsApp renders
 // a message as a voice note (PTT) only when the audio is Opus in an Ogg
 // container. Anything else has to be transcoded, which needs ffmpeg — already
@@ -35,25 +41,39 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
 )
 
-// WhatsApp's own ceilings. Documents are the most permissive; images and
-// audio are rejected server-side well below that. Checking locally turns a
-// confusing remote failure into a clear message before anything is uploaded.
+// WhatsApp's own ceilings. Checking locally turns a confusing remote failure
+// into a clear message before anything is uploaded.
 const (
-	maxImageBytes    = 16 << 20  // 16 MiB
-	maxAudioBytes    = 16 << 20  // 16 MiB
-	maxDocumentBytes = 100 << 20 // 100 MiB
+	// maxNativeMediaBytes is the ceiling for a photo, audio or voice note
+	// delivered as itself, the bubble that shows or plays inline. Past it the
+	// same bytes can still travel as a document, which is what planDelivery
+	// does instead of refusing.
+	maxNativeMediaBytes = 16 << 20 // 16 MiB
+
+	// maxNativeVideoBytes is the same for a video. It is the ceiling videos
+	// already had here before files grew to 2 GB (they fell under the old
+	// 100 MiB document limit and went out as video); keeping it means no
+	// video that used to play inline now arrives as a file.
+	maxNativeVideoBytes = 100 << 20 // 100 MiB
+
+	// maxDocumentBytes is the ceiling for a document. WhatsApp states it as
+	// "2 GB"; it is taken in decimal so that a file just under 2 GiB is
+	// refused here rather than after an upload that could take hours.
+	maxDocumentBytes = 2_000_000_000
 )
 
 // opusOggMIMEs are the containers WhatsApp accepts for a voice note as-is.
@@ -71,7 +91,8 @@ func outboundDir(cfg *Config) string {
 }
 
 // outboundFile is what a materialized draft body amounts to: bytes on local
-// disk, a content type, and the name the recipient should see.
+// disk, a content type, the name the recipient should see, and how it will be
+// delivered.
 //
 // Filename is carried out of here rather than read back off the request
 // because a URL download is the one input mode that can discover a name the
@@ -81,6 +102,18 @@ type outboundFile struct {
 	Path     string
 	MIME     string
 	Filename string
+	Size     int64
+	delivery
+}
+
+// delivery is how a draft's bytes will reach the recipient. It is decided once,
+// at draft time, and stored on the row, so the preview the user approves and
+// what confirm sends cannot disagree.
+type delivery struct {
+	AsDocument bool
+	// Downgraded is true when the document envelope was forced by size rather
+	// than asked for, so the preview can say why a video arrives as a file.
+	Downgraded bool
 }
 
 // fileSourceCount reports how many of the three input modes the caller used.
@@ -96,17 +129,6 @@ func fileSourceCount(req createDraftRequest) int {
 	return n
 }
 
-// fetchCeiling is the size limit applied while a file_url download streams,
-// chosen before the content type is known. It is deliberately the most
-// permissive limit that could apply: checkSizeLimit below applies the exact one
-// once resolveMIME has run.
-func fetchCeiling(sendType string) int64 {
-	if sendType == "audio" {
-		return maxAudioBytes
-	}
-	return maxDocumentBytes
-}
-
 // materializeOutboundFile writes the draft's bytes to disk and reports what to
 // store on the draft row.
 //
@@ -116,15 +138,38 @@ func fetchCeiling(sendType string) int64 {
 // base64 crosses the model's context, which caps out around a hundred
 // kilobytes. file_url is how anything larger gets here: the bridge fetches it
 // itself, which is why fetch_url.go exists and why its address guard is not
-// optional.
+// optional. (The remote MCP layer adds its own sources — Drive and upload
+// links — by staging the file on this machine and passing file_path.)
 func materializeOutboundFile(ctx context.Context, cfg *Config, draftID string, req createDraftRequest) (outboundFile, error) {
-	var data []byte
+	return materializeWithProgress(ctx, cfg, draftID, req, nil)
+}
+
+// materializeWithProgress is materializeOutboundFile reporting progress to job,
+// which may be nil.
+func materializeWithProgress(ctx context.Context, cfg *Config, draftID string, req createDraftRequest, job *mediaJob) (outboundFile, error) {
+	if fileSourceCount(req) > 1 {
+		return outboundFile{}, fmt.Errorf("pass exactly one of file_path, file_base64 or file_url")
+	}
+
+	dir := outboundDir(cfg)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return outboundFile{}, fmt.Errorf("creating outbound dir: %w", err)
+	}
+	// Bytes land in a .part file and get their final name only once they are
+	// accepted, so a rejected or interrupted draft never leaves a file that
+	// looks complete. The Remove is a no-op after the rename.
+	part := filepath.Join(dir, draftID+".part")
+	out, err := os.OpenFile(part, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return outboundFile{}, fmt.Errorf("creating outbound file: %w", err)
+	}
+	defer os.Remove(part)
+	defer out.Close()
+
+	w := &countingWriter{w: out, job: job}
 	var nameHint string
 
 	switch {
-	case fileSourceCount(req) > 1:
-		return outboundFile{}, fmt.Errorf("pass exactly one of file_path, file_base64 or file_url")
-
 	case req.FilePath != "":
 		clean := filepath.Clean(req.FilePath)
 		info, err := os.Stat(clean)
@@ -134,24 +179,51 @@ func materializeOutboundFile(ctx context.Context, cfg *Config, draftID string, r
 		if info.IsDir() {
 			return outboundFile{}, fmt.Errorf("file_path %q is a directory", req.FilePath)
 		}
-		data, err = os.ReadFile(clean)
+		// Regular files only. /dev/zero reports a size of 0 and never ends;
+		// a FIFO blocks until someone writes to it. Either would fill the
+		// disk the message database lives on, or hang the draft.
+		if !info.Mode().IsRegular() {
+			return outboundFile{}, fmt.Errorf("file_path %q is not a regular file", req.FilePath)
+		}
+		// Refused before copying: there is no point moving 3 GB to find out
+		// WhatsApp takes 2.
+		if info.Size() > maxDocumentBytes {
+			return outboundFile{}, tooLargeError(info.Size())
+		}
+		if job != nil {
+			job.bytesTotal.Store(info.Size())
+		}
+		job.setPhase("copiando el archivo")
+		src, err := os.Open(clean)
 		if err != nil {
 			return outboundFile{}, fmt.Errorf("reading file_path %q: %w", req.FilePath, err)
+		}
+		// Capped while copying too: the size above is only what the file was
+		// when it was looked at, and a file can grow after that.
+		_, err = io.Copy(w, io.LimitReader(ctxReader{ctx, src}, maxDocumentBytes+1))
+		src.Close()
+		if err != nil {
+			return outboundFile{}, fmt.Errorf("reading file_path %q: %w", req.FilePath, err)
+		}
+		if w.n > maxDocumentBytes {
+			return outboundFile{}, tooLargeError(w.n)
 		}
 		nameHint = filepath.Base(clean)
 
 	case req.FileBase64 != "":
-		var err error
-		data, err = base64.StdEncoding.DecodeString(req.FileBase64)
+		data, err := base64.StdEncoding.DecodeString(req.FileBase64)
 		if err != nil {
 			return outboundFile{}, fmt.Errorf("file_base64 is not valid base64: %w", err)
+		}
+		if _, err := w.Write(data); err != nil {
+			return outboundFile{}, fmt.Errorf("writing outbound file: %w", err)
 		}
 		nameHint = req.Filename
 
 	case req.FileURL != "":
-		var err error
+		job.setPhase("descargando file_url")
 		// The zero fetcher is the guarded one; see the type's doc comment.
-		data, nameHint, err = fetchRemoteFile(ctx, req.FileURL, fetchCeiling(req.SendType), fetcher{})
+		nameHint, _, err = fetchRemoteFileTo(ctx, req.FileURL, maxDocumentBytes, fetcher{}, w, job)
 		if err != nil {
 			return outboundFile{}, err
 		}
@@ -161,21 +233,24 @@ func materializeOutboundFile(ctx context.Context, cfg *Config, draftID string, r
 			"file_path, file_base64 or file_url required for send_type=%q", req.SendType)
 	}
 
-	if len(data) == 0 {
+	if w.n == 0 {
 		return outboundFile{}, fmt.Errorf("the file is empty")
+	}
+	if err := out.Close(); err != nil {
+		return outboundFile{}, fmt.Errorf("writing outbound file: %w", err)
 	}
 	if req.Filename != "" {
 		nameHint = req.Filename
 	}
 
-	mimeType := resolveMIME(req.MediaMIME, nameHint, data)
-	if err := checkSizeLimit(req.SendType, mimeType, len(data)); err != nil {
-		return outboundFile{}, err
+	head, err := readHead(part, 512)
+	if err != nil {
+		return outboundFile{}, fmt.Errorf("reading outbound file: %w", err)
 	}
-
-	dir := outboundDir(cfg)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return outboundFile{}, fmt.Errorf("creating outbound dir: %w", err)
+	mimeType := resolveMIME(req.MediaMIME, nameHint, head)
+	plan, err := planDelivery(req.SendType, mimeType, w.n, req.AsDocument, req.VoiceNote)
+	if err != nil {
+		return outboundFile{}, err
 	}
 
 	ext := filepath.Ext(nameHint)
@@ -184,11 +259,57 @@ func materializeOutboundFile(ctx context.Context, cfg *Config, draftID string, r
 			ext = exts[0]
 		}
 	}
-	out := filepath.Join(dir, draftID+ext)
-	if err := os.WriteFile(out, data, 0o600); err != nil {
+	final := filepath.Join(dir, draftID+ext)
+	if err := os.Rename(part, final); err != nil {
 		return outboundFile{}, fmt.Errorf("writing outbound file: %w", err)
 	}
-	return outboundFile{Path: out, MIME: mimeType, Filename: nameHint}, nil
+	return outboundFile{Path: final, MIME: mimeType, Filename: nameHint, Size: w.n, delivery: plan}, nil
+}
+
+// countingWriter counts what passes through it, for the empty-file check and
+// for progress.
+type countingWriter struct {
+	w   io.Writer
+	n   int64
+	job *mediaJob
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	if c.job != nil {
+		c.job.bytesDone.Add(int64(n))
+	}
+	return n, err
+}
+
+// ctxReader stops a local copy when its job is cancelled. A disk read never
+// blocks long enough to need more than a check between reads.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// readHead returns up to n bytes from the start of a file, for sniffing.
+func readHead(path string, n int) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, n)
+	got, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, err
+	}
+	return buf[:got], nil
 }
 
 // resolveMIME picks the most trustworthy answer available: an explicit
@@ -208,19 +329,94 @@ func resolveMIME(explicit, nameHint string, data []byte) string {
 	return strings.ToLower(http.DetectContentType(data))
 }
 
-func checkSizeLimit(sendType, mimeType string, size int) error {
-	limit := maxDocumentBytes
-	label := "documento"
+// planDelivery decides how a file of this type and size reaches WhatsApp, or
+// refuses it.
+//
+// Only one size is a hard limit: WhatsApp's 2 GB for a document. A photo or
+// audio file over the 16 MiB native ceiling, or a video over 100 MiB, is not
+// refused — it goes as a document, which arrives with its original bytes,
+// opens in the recipient's player or viewer, and is what the WhatsApp app
+// itself offers for large files. The previous rules refused a 17 MB photo
+// outright.
+//
+// A voice note has no document form to fall back on, so it is the exception.
+// Opus/Ogg is sent as it is and its size is final now; anything else is
+// transcoded at confirm, which shrinks it, so its check waits for the real
+// output (buildMediaMessage).
+func planDelivery(sendType, mimeType string, size int64, asDocument, voiceNote bool) (delivery, error) {
+	if size > maxDocumentBytes {
+		return delivery{}, tooLargeError(size)
+	}
+	if voiceNote {
+		if opusOggMIMEs[mimeType] && size > maxNativeMediaBytes {
+			return delivery{}, voiceNoteTooLargeError(size)
+		}
+		return delivery{}, nil
+	}
+	if asDocument {
+		return delivery{AsDocument: true}, nil
+	}
+	if ceiling := nativeCeiling(sendType, mimeType); ceiling > 0 && size > ceiling {
+		return delivery{AsDocument: true, Downgraded: true}, nil
+	}
+	return delivery{}, nil
+}
+
+// nativeCeiling is the largest file this kind of media can be and still go as
+// itself rather than as a document, or 0 for anything that is a document
+// already.
+func nativeCeiling(sendType, mimeType string) int64 {
 	switch {
-	case sendType == "audio":
-		limit, label = maxAudioBytes, "audio"
-	case strings.HasPrefix(mimeType, "image/"):
-		limit, label = maxImageBytes, "imagen"
+	case sendType == "audio", strings.HasPrefix(mimeType, "image/"):
+		return maxNativeMediaBytes
+	case strings.HasPrefix(mimeType, "video/"):
+		return maxNativeVideoBytes
+	default:
+		return 0
 	}
-	if size > limit {
-		return fmt.Errorf("el %s pesa %d bytes y WhatsApp acepta hasta %d", label, size, limit)
+}
+
+func tooLargeError(size int64) error {
+	return fmt.Errorf("el archivo pesa %s y WhatsApp acepta hasta %s por archivo",
+		humanBytes(size), humanBytes(maxDocumentBytes))
+}
+
+func voiceNoteTooLargeError(size int64) error {
+	return fmt.Errorf("la nota de voz pesa %s y WhatsApp acepta hasta %s; "+
+		"enviala como audio normal (voice_note=false), que viaja como documento",
+		humanBytes(size), humanBytes(maxNativeMediaBytes))
+}
+
+// humanBytes renders a size the way a person reads it: "85.3 MB", "1.9 GB".
+func humanBytes(n int64) string {
+	const unit = 1000
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
 	}
-	return nil
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "kMGT"[exp])
+}
+
+// deliveredAs names the envelope a draft will use, for the preview and the
+// status answer.
+func deliveredAs(sendType, mimeType string, d delivery, voiceNote bool) string {
+	switch pickMediaType(sendType, mimeType, d.AsDocument, voiceNote) {
+	case whatsmeow.MediaImage:
+		return "photo"
+	case whatsmeow.MediaVideo:
+		return "video"
+	case whatsmeow.MediaAudio:
+		if voiceNote {
+			return "voice_note"
+		}
+		return "audio"
+	default:
+		return "document"
+	}
 }
 
 // pickMediaType maps a draft onto one of whatsmeow's four upload kinds.
@@ -232,13 +428,17 @@ func checkSizeLimit(sendType, mimeType string, size int) error {
 //
 // as_document deliberately wins over the MIME type. WhatsApp recompresses
 // anything sent as an image, so "send this receipt as a document" has to be
-// able to override what the bytes look like.
-func pickMediaType(sendType, mimeType string, asDocument bool) whatsmeow.MediaType {
-	if sendType == "audio" {
+// able to override what the bytes look like. A voice note is the exception:
+// it only exists as audio, so nothing turns it into a document.
+func pickMediaType(sendType, mimeType string, asDocument, voiceNote bool) whatsmeow.MediaType {
+	if sendType == "audio" && voiceNote {
 		return whatsmeow.MediaAudio
 	}
 	if asDocument {
 		return whatsmeow.MediaDocument
+	}
+	if sendType == "audio" {
+		return whatsmeow.MediaAudio
 	}
 	switch {
 	case strings.HasPrefix(mimeType, "image/"):
@@ -259,15 +459,18 @@ type mediaMessageOpts struct {
 	MIME       string
 	Filename   string
 	Caption    string
-	AsDocument bool // force the document path even for an image
+	AsDocument bool // deliver as a document: asked for, or forced by size
 	VoiceNote  bool // render as PTT rather than an audio attachment
 	FFmpegBin  string
 }
 
 // buildMediaMessage uploads the draft's bytes and returns the protobuf to
 // send. This is the only function here that touches the network, and it is
-// called exclusively from the confirm handler.
-func buildMediaMessage(ctx context.Context, cli *whatsmeow.Client, o mediaMessageOpts) (*waE2E.Message, error) {
+// called exclusively from the confirm path.
+//
+// job, when non-nil, receives the phase and upload progress, and is how a
+// stalled upload gets noticed (see uploadTracker).
+func buildMediaMessage(ctx context.Context, cli *whatsmeow.Client, o mediaMessageOpts, job *mediaJob) (*waE2E.Message, error) {
 	path := o.Path
 	mimeType := o.MIME
 
@@ -275,23 +478,45 @@ func buildMediaMessage(ctx context.Context, cli *whatsmeow.Client, o mediaMessag
 	// so a correctly-formatted file never pays for ffmpeg — and a deployment
 	// without ffmpeg can still send those.
 	if o.SendType == "audio" && o.VoiceNote && !opusOggMIMEs[mimeType] {
+		job.setPhase("convirtiendo a nota de voz")
 		converted, err := transcodeToOpusOgg(ctx, o.FFmpegBin, path)
 		if err != nil {
 			return nil, err
 		}
 		defer os.Remove(converted)
+		if st, err := os.Stat(converted); err == nil && st.Size() > maxNativeMediaBytes {
+			return nil, voiceNoteTooLargeError(st.Size())
+		}
 		path = converted
 		mimeType = "audio/ogg; codecs=opus"
 	}
 
-	data, err := os.ReadFile(path)
+	src, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading draft file: %w", err)
 	}
+	defer src.Close()
+	if st, err := src.Stat(); err == nil && job != nil {
+		job.bytesTotal.Store(st.Size())
+	}
 
-	mediaType := pickMediaType(o.SendType, mimeType, o.AsDocument)
+	// UploadReader encrypts into a scratch file and uploads from it, so the
+	// plaintext is read once and nothing is ever held in memory. The scratch
+	// file sits next to the draft, on the same disk and with the same 0700
+	// directory, rather than in a world-readable temp dir.
+	scratch, err := os.CreateTemp(filepath.Dir(path), ".upload-*.enc")
+	if err != nil {
+		return nil, fmt.Errorf("creating upload scratch file: %w", err)
+	}
+	defer func() {
+		scratch.Close()
+		os.Remove(scratch.Name())
+	}()
 
-	up, err := cli.Upload(ctx, data, mediaType)
+	mediaType := pickMediaType(o.SendType, mimeType, o.AsDocument, o.VoiceNote)
+
+	job.setPhase("cifrando")
+	up, err := cli.UploadReader(ctx, src, &uploadTracker{f: scratch, job: job}, mediaType)
 	if err != nil {
 		return nil, fmt.Errorf("uploading media: %w", err)
 	}
@@ -350,6 +575,42 @@ func buildMediaMessage(ctx context.Context, cli *whatsmeow.Client, o mediaMessag
 			FileLength:    proto.Uint64(up.FileLength),
 		}}, nil
 	}
+}
+
+// uploadTracker is the scratch file UploadReader encrypts into and then
+// uploads from. It exists to see that second half: whatsmeow reports no
+// progress of its own, but every byte it uploads is read through here, after
+// the one Seek back to the start that separates encrypting from uploading.
+type uploadTracker struct {
+	f         *os.File
+	job       *mediaJob
+	uploading atomic.Bool
+}
+
+func (u *uploadTracker) Write(p []byte) (int, error) {
+	n, err := u.f.Write(p)
+	if u.job != nil {
+		// Encrypting counts as activity, so a slow disk is not mistaken for
+		// a stalled upload; it is not shown as upload progress.
+		u.job.moves.Add(1)
+	}
+	return n, err
+}
+
+func (u *uploadTracker) Read(p []byte) (int, error) {
+	n, err := u.f.Read(p)
+	if n > 0 && u.job != nil && u.uploading.Load() {
+		u.job.bytesDone.Add(int64(n))
+	}
+	return n, err
+}
+
+func (u *uploadTracker) Seek(offset int64, whence int) (int64, error) {
+	if offset == 0 && whence == io.SeekStart && u.job != nil && !u.uploading.Swap(true) {
+		u.job.bytesDone.Store(0)
+		u.job.setPhase("subiendo a WhatsApp")
+	}
+	return u.f.Seek(offset, whence)
 }
 
 // nonEmpty returns nil for an empty caption rather than a pointer to "".

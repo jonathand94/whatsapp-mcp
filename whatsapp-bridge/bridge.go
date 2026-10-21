@@ -54,6 +54,10 @@ type Bridge struct {
 	// history. See backfill_walk.go.
 	walker *backfillWalker
 
+	// retries routes the phone's answers to media retry receipts back to the
+	// downloads waiting on them. See media_retry.go.
+	retries mediaRetryWaiters
+
 	mu            sync.RWMutex
 	connected     bool
 	authenticated bool
@@ -224,6 +228,8 @@ func (b *Bridge) handleEvent(raw interface{}) {
 		b.onUndecryptableMessage(evt)
 	case *events.Receipt:
 		b.onReceipt(evt)
+	case *events.MediaRetry:
+		b.onMediaRetry(evt)
 	case *events.Connected:
 		b.mu.Lock()
 		b.connected = true
@@ -447,8 +453,8 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	//     MYC-3284 exists to prevent.
 	_, err = b.db.Exec(`
 		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
-			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, raw_type)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, raw_type, media_filename)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			type = excluded.type,
 			content_text = excluded.content_text,
@@ -467,7 +473,8 @@ func (b *Bridge) onMessage(evt *events.Message) {
 			media_sha256 = excluded.media_sha256,
 			media_file_length = excluded.media_file_length,
 			media_key_timestamp = excluded.media_key_timestamp,
-			media_mime = excluded.media_mime
+			media_mime = excluded.media_mime,
+			media_filename = excluded.media_filename
 		WHERE messages.content_text LIKE ?
 		  AND (COALESCE(excluded.content_text, '') <> '' OR excluded.type <> 'system')
 	`, id, chatJID, senderJID, senderDisplay, ts, msgType, content, normalized,
@@ -475,7 +482,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 		mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
 		mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
 		mfields.MediaKeyTimestamp, mfields.MediaMime, rawTypeNullable(msgType, content),
-		undecryptablePrefix+"%")
+		mfields.MediaFilename, undecryptablePrefix+"%")
 	if err != nil {
 		log.Printf("onMessage: message insert failed: %v", err)
 	}

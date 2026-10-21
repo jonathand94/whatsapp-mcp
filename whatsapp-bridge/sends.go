@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -65,11 +66,19 @@ type createDraftRequest struct {
 
 type createDraftResponse struct {
 	DraftID             string `json:"draft_id"`
+	Status              string `json:"status"` // always "draft": the row exists and can be confirmed
 	RecipientJID        string `json:"recipient_jid"`
 	RecipientDisplay    string `json:"recipient_display"`
 	Preview             string `json:"preview"`
 	ExpiresAt           int64  `json:"expires_at"`
 	RecipientContactHit bool   `json:"recipient_contact_hit"`
+
+	// Media drafts only. DeliveredAs is the envelope confirm will use (photo,
+	// video, audio, voice_note or document); Note explains it when it is not
+	// what the caller would expect, e.g. a 90 MB video going as a document.
+	DeliveredAs string `json:"delivered_as,omitempty"`
+	SizeBytes   int64  `json:"size_bytes,omitempty"`
+	Note        string `json:"note,omitempty"`
 }
 
 func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
@@ -151,6 +160,31 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 	recipientDisplay, hit := s.resolveRecipient(r.Context(), req.RecipientJID)
 
 	draftID := uuid.New().String()
+
+	// Media drafts land on local disk now and are uploaded only at confirm,
+	// so no bytes reach WhatsApp before the user approves the send. For
+	// file_url this is also where the download happens, so a fetch that is
+	// refused or oversized fails here — before a row exists.
+	//
+	// Getting the bytes can take minutes for a large file, so it runs as a
+	// job: a small file is answered exactly as before, a large one gets 202
+	// and GET /api/sends/{draft_id} reports progress until the draft exists.
+	if req.SendType == "file" || req.SendType == "audio" {
+		j, _ := s.jobs().start("draft:"+draftID, func(j *mediaJob) (int, any) {
+			ctx, cancel := context.WithTimeout(s.rootContext(), mediaJobTimeout)
+			defer cancel()
+			return s.createMediaDraft(ctx, j, draftID, req, recipientDisplay, hit)
+		})
+		answerJob(w, r, j, jobPending{
+			DraftID:          draftID,
+			RecipientJID:     req.RecipientJID,
+			RecipientDisplay: recipientDisplay,
+			Status:           "preparing",
+			Hint:             "el archivo se esta preparando; consulta el estado del borrador y confirmalo cuando diga 'draft'",
+		})
+		return
+	}
+
 	now := time.Now().Unix()
 
 	// For reactions, use the reaction target as the "quoted" message and the emoji as text.
@@ -162,76 +196,127 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 		quotedID = req.ReactionTarget
 	}
 
-	// Media drafts land on local disk now and are uploaded only at confirm,
-	// so no bytes reach WhatsApp before the user approves the send. For
-	// file_url this is also where the download happens, so a fetch that is
-	// refused or oversized fails here — before a row exists.
-	var media outboundFile
-	if req.SendType == "file" || req.SendType == "audio" {
-		var mErr error
-		media, mErr = materializeOutboundFile(r.Context(), s.cfg, draftID, req)
-		if mErr != nil {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "media rejected", Details: mErr.Error()})
-			return
-		}
-		// The caption is the message body for media, so it rides in the same
-		// column every other send type uses for its text.
-		contentText = req.Caption
-	}
-
 	_, err := s.db.ExecContext(r.Context(), `
 		INSERT INTO sends (draft_id, recipient_jid, recipient_display, send_type, content_text,
 		                   content_file_path, content_media_mime, media_filename, media_as_document, media_voice_note,
 		                   quoted_message_id, reaction_emoji, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+		VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, 'draft', ?)
 	`, draftID, req.RecipientJID, recipientDisplay, req.SendType, contentText,
-		nullString(media.Path), nullString(media.MIME), nullString(media.Filename), boolToInt(req.AsDocument), boolToInt(req.VoiceNote),
 		nullString(quotedID), nullString(req.ReactionEmoji), now)
 	if err != nil {
-		// Don't leave the bytes behind if the row that would reference them
-		// never existed.
-		if rmErr := removeOutboundFile(media.Path); rmErr != nil {
-			log.Printf("draft %s: insert failed and cleanup failed too: %v", draftID, rmErr)
-		}
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "draft insert failed", Details: err.Error()})
 		return
 	}
 
 	preview := truncate(req.Text, 200)
-	switch req.SendType {
-	case "reaction":
+	if req.SendType == "reaction" {
 		preview = fmt.Sprintf("Reaction %s to message %s", req.ReactionEmoji, truncate(req.ReactionTarget, 32))
-	case "file", "audio":
-		kind := media.MIME
-		if req.SendType == "audio" && req.VoiceNote {
-			kind = "voice note (" + media.MIME + ")"
-		} else if req.AsDocument {
-			kind = "document (" + media.MIME + ")"
-		}
-		// Show the name the RECIPIENT will see, not the draft_id-based name
-		// the bytes happen to be stored under. The preview exists so the
-		// user can check what they are approving; showing them an internal
-		// identifier instead of the real filename defeats that. It is the
-		// same string that goes into media_filename, so what is approved and
-		// what is delivered cannot drift apart.
-		shown := media.Filename
-		if shown == "" || shown == "." {
-			shown = filepath.Base(media.Path)
-		}
-		preview = fmt.Sprintf("%s, %s", kind, shown)
-		if req.Caption != "" {
-			preview += " — " + truncate(req.Caption, 120)
-		}
 	}
 
 	writeJSON(w, http.StatusOK, createDraftResponse{
 		DraftID:             draftID,
+		Status:              "draft",
 		RecipientJID:        req.RecipientJID,
 		RecipientDisplay:    recipientDisplay,
 		Preview:             preview,
 		ExpiresAt:           now + draftTTLSeconds,
 		RecipientContactHit: hit,
 	})
+}
+
+// createMediaDraft gets a media draft's bytes onto local disk and inserts its
+// row. It runs as the draft's job, so it answers with a status and body
+// rather than writing a response.
+func (s *Server) createMediaDraft(ctx context.Context, j *mediaJob, draftID string, req createDraftRequest, recipientDisplay string, hit bool) (int, any) {
+	media, err := materializeWithProgress(ctx, s.cfg, draftID, req, j)
+	if err != nil {
+		return http.StatusBadRequest, errorResponse{Error: "media rejected", Details: err.Error()}
+	}
+
+	// The draft's hour starts when its bytes are ready, not when the request
+	// arrived: a long download must not produce a draft that expires moments
+	// after it could first be confirmed.
+	now := time.Now().Unix()
+
+	// The caption is the message body for media, so it rides in the same
+	// column every other send type uses for its text. media_as_document holds
+	// the planned envelope — asked for, or forced by size — so confirm sends
+	// exactly what the preview showed.
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO sends (draft_id, recipient_jid, recipient_display, send_type, content_text,
+		                   content_file_path, content_media_mime, media_filename, media_as_document, media_voice_note,
+		                   quoted_message_id, reaction_emoji, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'draft', ?)
+	`, draftID, req.RecipientJID, recipientDisplay, req.SendType, req.Caption,
+		media.Path, nullString(media.MIME), nullString(media.Filename),
+		boolToInt(media.AsDocument), boolToInt(req.VoiceNote), now)
+	if err != nil {
+		// Don't leave the bytes behind if the row that would reference them
+		// never existed.
+		if rmErr := removeOutboundFile(media.Path); rmErr != nil {
+			log.Printf("draft %s: insert failed and cleanup failed too: %v", draftID, rmErr)
+		}
+		return http.StatusInternalServerError, errorResponse{Error: "draft insert failed", Details: err.Error()}
+	}
+
+	as := deliveredAs(req.SendType, media.MIME, media.delivery, req.VoiceNote)
+	return http.StatusOK, createDraftResponse{
+		DraftID:             draftID,
+		Status:              "draft",
+		RecipientJID:        req.RecipientJID,
+		RecipientDisplay:    recipientDisplay,
+		Preview:             mediaPreview(req, media, as),
+		ExpiresAt:           now + draftTTLSeconds,
+		RecipientContactHit: hit,
+		DeliveredAs:         as,
+		SizeBytes:           media.Size,
+		Note:                deliveryNote(req, media),
+	}
+}
+
+// mediaPreview is the line the user reads before approving a media send.
+func mediaPreview(req createDraftRequest, media outboundFile, as string) string {
+	kind := media.MIME
+	switch as {
+	case "voice_note":
+		kind = "voice note (" + media.MIME + ")"
+	case "document":
+		kind = "document (" + media.MIME + ")"
+	}
+	// Show the name the RECIPIENT will see, not the draft_id-based name
+	// the bytes happen to be stored under. The preview exists so the
+	// user can check what they are approving; showing them an internal
+	// identifier instead of the real filename defeats that. It is the
+	// same string that goes into media_filename, so what is approved and
+	// what is delivered cannot drift apart.
+	shown := media.Filename
+	if shown == "" || shown == "." {
+		shown = filepath.Base(media.Path)
+	}
+	preview := fmt.Sprintf("%s, %s, %s", kind, shown, humanBytes(media.Size))
+	if req.Caption != "" {
+		preview += " — " + truncate(req.Caption, 120)
+	}
+	return preview
+}
+
+// deliveryNote explains an envelope the caller did not ask for.
+func deliveryNote(req createDraftRequest, media outboundFile) string {
+	if !media.Downgraded {
+		return ""
+	}
+	what := "archivo"
+	switch {
+	case req.SendType == "audio":
+		what = "audio"
+	case strings.HasPrefix(media.MIME, "image/"):
+		what = "foto"
+	case strings.HasPrefix(media.MIME, "video/"):
+		what = "video"
+	}
+	return fmt.Sprintf("va como documento: pesa %s y WhatsApp solo acepta %s para enviarlo como %s; "+
+		"el destinatario lo recibe completo, sin compresion, y lo abre con un toque",
+		humanBytes(media.Size), humanBytes(nativeCeiling(req.SendType, media.MIME)), what)
 }
 
 // --- Confirm (commits the send) ---------------------------------------------
@@ -252,6 +337,48 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "draft_id required"})
 		return
 	}
+
+	// A media draft whose bytes are still arriving has no row yet, so the
+	// lookup below would call it "not found". Say what is actually going on —
+	// and if preparing it failed, say why, since there is no row to say so.
+	if prep := s.jobs().get("draft:" + draftID); prep != nil {
+		if prep.running() {
+			p := prep.pending(jobPending{})
+			writeJSON(w, http.StatusConflict, errorResponse{
+				Error: "draft still preparing",
+				Details: fmt.Sprintf("el archivo todavia se esta preparando (%s de %s); "+
+					"confirma cuando el estado del borrador diga 'draft'",
+					humanBytes(p.BytesDone), humanBytes(p.BytesTotal)),
+			})
+			return
+		}
+		if prep.status != http.StatusOK {
+			writeJSON(w, prep.status, prep.body)
+			return
+		}
+	}
+
+	// Confirm is idempotent, because for a large file the caller has to ask
+	// more than once: the first confirm answers 202 while the upload runs.
+	// An upload still running is joined, never repeated — the draft stays in
+	// 'draft' until its upload finishes, so without this a second confirm
+	// would pass every check and upload the same file again. An upload that
+	// already delivered the message answers with that delivery.
+	if up := s.jobs().get("send:" + draftID); up != nil {
+		if up.running() {
+			answerJob(w, r, up, jobPending{DraftID: draftID, Status: "uploading", Hint: uploadingHint})
+			return
+		}
+		if up.status == http.StatusOK {
+			writeJSON(w, up.status, up.body)
+			return
+		}
+	}
+	if code, body, settled := s.settledConfirm(r.Context(), draftID); settled {
+		writeJSON(w, code, body)
+		return
+	}
+
 	if s.bridge == nil || !s.bridge.IsConnected() {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{
 			Error:   "bridge not connected to WhatsApp",
@@ -287,10 +414,9 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if status != "draft" {
-		writeJSON(w, http.StatusConflict, errorResponse{
-			Error:   fmt.Sprintf("draft already in state %q, expected 'draft'", status),
-			Details: "each draft can only be confirmed once; create a new draft to retry",
-		})
+		// Settled between the check above and this read: answer from the row.
+		code, body, _ := s.settledConfirm(r.Context(), draftID)
+		writeJSON(w, code, body)
 		return
 	}
 	if time.Now().Unix() > createdAt+draftTTLSeconds {
@@ -391,12 +517,16 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		}
 	case "file", "audio":
 		// Upload happens here, not at draft time, so the user's bytes never
-		// leave the machine until they confirm. Given its own timeout: a
-		// large document can legitimately outlast the 30s the send itself
-		// gets, and reusing that budget would fail slow uploads as if the
-		// send had failed.
-		upCtx, upCancel := context.WithTimeout(r.Context(), 5*time.Minute)
-		msg, err = buildMediaMessage(upCtx, s.bridge.client, mediaMessageOpts{
+		// leave the machine until they confirm. It runs as a job, detached
+		// from this request: a 2 GB upload can take hours, and answering
+		// "failed" when the HTTP client gave up — while the upload carried on
+		// and the message went out — is how a duplicate send happens.
+		//
+		// The draft stays in 'draft' for the whole upload; commitSend flips it
+		// only once the bytes are on WhatsApp's servers. So a failed or
+		// interrupted upload leaves a draft that can simply be confirmed
+		// again, and a restart mid-upload cannot leave a send in limbo.
+		opts := mediaMessageOpts{
 			SendType:   sendType,
 			Path:       mediaPath,
 			MIME:       mediaMIME,
@@ -405,19 +535,60 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 			AsDocument: mediaAsDocument == 1,
 			VoiceNote:  mediaVoiceNote == 1,
 			FFmpegBin:  s.cfg.FFmpegBinPath,
-		})
-		upCancel()
-		if err != nil {
-			// The draft is still in 'draft' at this point, so a transient
-			// upload failure can simply be retried on the same draft rather
-			// than forcing the caller to rebuild it.
-			log.Printf("media upload failed draft=%s: %v", draftID, err)
-			writeJSON(w, http.StatusBadGateway, errorResponse{
-				Error:   "media upload failed",
-				Details: err.Error(),
-			})
-			return
 		}
+		up, _ := s.jobs().start("send:"+draftID, func(j *mediaJob) (int, any) {
+			ctx, cancel := context.WithTimeout(s.rootContext(), mediaJobTimeout)
+			defer cancel()
+
+			// Another confirm can have sent this draft, and spent its file,
+			// between this request's checks and this job starting. The row
+			// knows; the request that started the job does not.
+			if code, body, settled := s.settledConfirm(ctx, draftID); settled {
+				return code, body
+			}
+
+			// The stall watch gets the upload's own context, never the one
+			// the send runs under: a watch that fires as the upload returns
+			// must not be able to cancel the send that follows.
+			upCtx, upCancel := context.WithCancel(ctx)
+			stop, stalled := watchStall(upCancel, j.activity, stallTimeout)
+			built, err := buildMediaMessage(upCtx, s.bridge.client, opts, j)
+			stop()
+			upCancel()
+			if err != nil {
+				if stalled.Load() {
+					err = fmt.Errorf("la subida se detuvo: no se movieron datos en %s", stallTimeout)
+				}
+				log.Printf("media upload failed draft=%s: %v", draftID, err)
+				return http.StatusBadGateway, errorResponse{
+					Error:   "media upload failed",
+					Details: err.Error() + ". Nothing was sent and the draft can be confirmed again.",
+				}
+			}
+
+			// An upload can take hours, and the connection can drop in the
+			// meantime. Sending now would fail before anything left this
+			// machine and burn the draft as 'failed'; waiting a little for
+			// the reconnect, and otherwise leaving the draft a draft, keeps it
+			// usable.
+			if !s.awaitConnection(ctx, reconnectGrace) {
+				return http.StatusServiceUnavailable, errorResponse{
+					Error: "bridge not connected to WhatsApp",
+					Details: "el archivo se subio, pero WhatsApp se desconecto antes de enviarlo. " +
+						"Nada se envio y el borrador sigue vigente: confirmalo de nuevo cuando vuelva la conexion.",
+				}
+			}
+			j.setPhase("enviando el mensaje")
+			return s.commitSend(ctx, draftID, recipient, recipientJID, recipientDisplay, mediaPath, built)
+		})
+		answerJob(w, r, up, jobPending{
+			DraftID:          draftID,
+			RecipientJID:     recipientJID,
+			RecipientDisplay: recipientDisplay,
+			Status:           "uploading",
+			Hint:             uploadingHint,
+		})
+		return
 	default:
 		writeJSON(w, http.StatusInternalServerError, errorResponse{
 			Error:   fmt.Sprintf("unsupported send_type %q reached confirm", sendType),
@@ -426,36 +597,133 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	code, body := s.commitSend(r.Context(), draftID, recipient, recipientJID, recipientDisplay, "", msg)
+	writeJSON(w, code, body)
+}
+
+// uploadingHint tells a caller holding a 202 from confirm what to do next.
+const uploadingHint = "el archivo se esta subiendo a WhatsApp. Vuelve a confirmar el mismo borrador (o consulta su estado) " +
+	"para saber cuando se envie: confirmar otra vez solo se une a esta subida. No crees un borrador nuevo"
+
+// reconnectGrace is how long a finished upload waits for WhatsApp to come
+// back before giving up on sending for now.
+const reconnectGrace = 2 * time.Minute
+
+// settledConfirm answers a confirm for a draft that is not a plain draft any
+// more, from its row: the delivery that already happened, or why there will
+// not be one. settled is false when the draft is still 'draft' and the
+// confirm should go ahead.
+//
+// Before confirms could take minutes this was just "409, already confirmed".
+// Now a caller re-confirms to learn how its upload ended, and telling it
+// "create a new draft" about a message that was delivered is how the same
+// file reaches someone twice.
+func (s *Server) settledConfirm(ctx context.Context, draftID string) (code int, body any, settled bool) {
+	var status, recipientJID, recipientDisplay, whatsappID, errMsg string
+	var sentAt int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT status, recipient_jid, COALESCE(recipient_display, ''), COALESCE(whatsapp_message_id, ''),
+		       COALESCE(sent_at, 0), COALESCE(error_message, '')
+		FROM sends WHERE draft_id = ?`, draftID,
+	).Scan(&status, &recipientJID, &recipientDisplay, &whatsappID, &sentAt, &errMsg)
+	switch {
+	case err == sql.ErrNoRows:
+		return http.StatusNotFound, errorResponse{Error: "draft not found", Details: draftID}, true
+	case err != nil:
+		return http.StatusInternalServerError, errorResponse{Error: "draft lookup failed", Details: err.Error()}, true
+	}
+	switch status {
+	case "draft":
+		return 0, nil, false
+	case "sent":
+		return http.StatusOK, confirmResponse{
+			DraftID:           draftID,
+			Status:            "sent",
+			WhatsAppMessageID: whatsappID,
+			SentAt:            sentAt,
+			RecipientJID:      recipientJID,
+			RecipientDisplay:  recipientDisplay,
+		}, true
+	case "confirmed":
+		return http.StatusConflict, errorResponse{
+			Error: "send in progress or interrupted",
+			Details: "este envio ya se confirmo y no ha terminado, o lo interrumpio un reinicio. " +
+				"Revisa el chat en WhatsApp antes de crear otro borrador",
+		}, true
+	case "failed":
+		return http.StatusConflict, errorResponse{
+			Error:   "send failed",
+			Details: errMsg + ". Este borrador ya no se puede usar; crea uno nuevo para reintentar",
+		}, true
+	case "expired":
+		return http.StatusGone, errorResponse{
+			Error:   "draft expired",
+			Details: fmt.Sprintf("drafts expire after %d seconds; create a new draft", draftTTLSeconds),
+		}, true
+	default:
+		return http.StatusConflict, errorResponse{
+			Error:   fmt.Sprintf("draft in state %q", status),
+			Details: "create a new draft to retry",
+		}, true
+	}
+}
+
+// awaitConnection reports whether WhatsApp is connected, waiting up to grace
+// for a reconnect when it is not.
+func (s *Server) awaitConnection(ctx context.Context, grace time.Duration) bool {
+	deadline := time.Now().Add(grace)
+	for {
+		if s.bridge != nil && s.bridge.IsConnected() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// commitSend flips a draft to 'confirmed', sends msg, and records the result.
+// Every send type ends here: text inline from the handler, media from the job
+// that uploaded its file. ctx bounds the flip and the send; the bookkeeping
+// after a successful send is deliberately detached from it (see persistCtx).
+func (s *Server) commitSend(ctx context.Context, draftID string, recipient types.JID, recipientJID, recipientDisplay, mediaPath string, msg *waE2E.Message) (int, any) {
 	// Flip to confirmed BEFORE sending, so double-confirm races are blocked.
 	now := time.Now().Unix()
-	res, err := s.db.ExecContext(r.Context(),
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE sends SET status='confirmed', confirmed_at=? WHERE draft_id=? AND status='draft'`,
 		now, draftID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "confirm update failed", Details: err.Error()})
-		return
+		return http.StatusInternalServerError, errorResponse{Error: "confirm update failed", Details: err.Error()}
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		writeJSON(w, http.StatusConflict, errorResponse{Error: "race: draft changed state during confirm"})
-		return
+		return http.StatusConflict, errorResponse{Error: "race: draft changed state during confirm"}
 	}
 
 	// Execute the send. This is the only place an actual outbound network call happens.
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	sendCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	sendResp, sendErr := s.bridge.client.SendMessage(ctx, recipient, msg)
+	sendResp, sendErr := s.bridge.client.SendMessage(sendCtx, recipient, msg)
 	if sendErr != nil {
 		log.Printf("send failed draft=%s recipient=%s: %v", draftID, recipientJID, sendErr)
-		_, _ = s.db.ExecContext(r.Context(),
+		_, _ = s.db.ExecContext(ctx,
 			`UPDATE sends SET status='failed', error_message=? WHERE draft_id=?`,
 			sendErr.Error(), draftID)
-		writeJSON(w, http.StatusBadGateway, errorResponse{
+		// A failed draft can never be confirmed again, so its bytes — up to
+		// 2 GB now — are dead weight from here on.
+		if rmErr := removeOutboundFile(mediaPath); rmErr != nil {
+			log.Printf("draft %s failed; removing %s failed: %v", draftID, mediaPath, rmErr)
+		}
+		return http.StatusBadGateway, errorResponse{
 			Error:   "send failed",
 			Details: sendErr.Error(),
-		})
-		return
+		}
 	}
 
 	sentAt := time.Now().Unix()
@@ -476,7 +744,7 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	// bounded, so a wedged DB cannot hang the handler either. What no handler can
 	// prevent is the process stopping here — see ReconcileInFlightSends.
 	persistCtx, cancelPersist := context.WithTimeout(
-		context.WithoutCancel(r.Context()), 15*time.Second)
+		context.WithoutCancel(ctx), 15*time.Second)
 	defer cancelPersist()
 
 	if _, err := s.db.ExecContext(persistCtx,
@@ -508,14 +776,14 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	scrubbed, flags := Scrub(persistText)
 	_, err = s.db.ExecContext(persistCtx, `
 		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
-			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, media_filename)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
 	`, whatsappID, recipientJID, senderJID, nullString(s.bridge.client.Store.PushName), sentAt, persistType,
 		persistText, Normalize(persistText), scrubbed, ScrubFlagsJSON(flags),
 		mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
 		mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
-		mfields.MediaKeyTimestamp, mfields.MediaMime)
+		mfields.MediaKeyTimestamp, mfields.MediaMime, mfields.MediaFilename)
 	if err != nil {
 		log.Printf("sent-message persist failed: %v", err)
 	}
@@ -529,14 +797,127 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		log.Printf("draft %s sent; removing %s failed: %v", draftID, mediaPath, rmErr)
 	}
 
-	writeJSON(w, http.StatusOK, confirmResponse{
+	return http.StatusOK, confirmResponse{
 		DraftID:           draftID,
 		Status:            "sent",
 		WhatsAppMessageID: whatsappID,
 		SentAt:            sentAt,
 		RecipientJID:      recipientJID,
 		RecipientDisplay:  recipientDisplay,
-	})
+	}
+}
+
+// --- Status (where a draft is in its life) -----------------------------------
+
+// sendStatusResponse answers GET /api/sends/{draft_id}. It exists for the
+// callers that got 202: to learn when a preparing draft can be confirmed, and
+// whether an upload ended with the message sent.
+type sendStatusResponse struct {
+	DraftID string `json:"draft_id"`
+	// Status is one of: preparing, rejected (preparation failed, so there is
+	// no draft), draft, uploading, confirmed, sent, failed, expired.
+	Status            string `json:"status"`
+	RecipientJID      string `json:"recipient_jid,omitempty"`
+	RecipientDisplay  string `json:"recipient_display,omitempty"`
+	SendType          string `json:"send_type,omitempty"`
+	Preview           string `json:"preview,omitempty"`
+	DeliveredAs       string `json:"delivered_as,omitempty"`
+	SizeBytes         int64  `json:"size_bytes,omitempty"`
+	Note              string `json:"note,omitempty"`
+	ExpiresAt         int64  `json:"expires_at,omitempty"`
+	WhatsAppMessageID string `json:"whatsapp_message_id,omitempty"`
+	SentAt            int64  `json:"sent_at,omitempty"`
+	Error             string `json:"error,omitempty"`
+	// LastAttemptError is why the most recent confirm failed before anything
+	// was sent. The draft is still usable; confirming again retries.
+	LastAttemptError string `json:"last_attempt_error,omitempty"`
+}
+
+func (s *Server) handleSendStatus(w http.ResponseWriter, r *http.Request) {
+	draftID := r.PathValue("draft_id")
+	if draftID == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "draft_id required"})
+		return
+	}
+
+	var prepared *createDraftResponse
+	if prep := s.jobs().get("draft:" + draftID); prep != nil {
+		if prep.running() {
+			writeJSON(w, http.StatusOK, prep.pending(jobPending{DraftID: draftID, Status: "preparing"}))
+			return
+		}
+		if prep.status != http.StatusOK {
+			// The draft never came to exist, and this is the only place the
+			// reason survives.
+			writeJSON(w, http.StatusOK, sendStatusResponse{
+				DraftID: draftID, Status: "rejected", Error: errorText(prep.body),
+			})
+			return
+		}
+		if cdr, ok := prep.body.(createDraftResponse); ok {
+			prepared = &cdr
+		}
+	}
+	up := s.jobs().get("send:" + draftID)
+	if up != nil && up.running() {
+		writeJSON(w, http.StatusOK, up.pending(jobPending{DraftID: draftID, Status: "uploading"}))
+		return
+	}
+
+	var (
+		resp                            sendStatusResponse
+		mediaMIME                       string
+		mediaAsDocument, mediaVoiceNote int
+		createdAt                       int64
+	)
+	err := s.db.QueryRowContext(r.Context(), `
+		SELECT status, recipient_jid, COALESCE(recipient_display, ''), send_type,
+		       COALESCE(content_media_mime, ''), media_as_document, media_voice_note, created_at,
+		       COALESCE(sent_at, 0), COALESCE(whatsapp_message_id, ''), COALESCE(error_message, '')
+		FROM sends WHERE draft_id = ?`, draftID,
+	).Scan(&resp.Status, &resp.RecipientJID, &resp.RecipientDisplay, &resp.SendType,
+		&mediaMIME, &mediaAsDocument, &mediaVoiceNote, &createdAt,
+		&resp.SentAt, &resp.WhatsAppMessageID, &resp.Error)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusNotFound, errorResponse{Error: "draft not found", Details: draftID})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "draft lookup failed", Details: err.Error()})
+		return
+	}
+	resp.DraftID = draftID
+
+	if resp.SendType == "file" || resp.SendType == "audio" {
+		resp.DeliveredAs = deliveredAs(resp.SendType, mediaMIME,
+			delivery{AsDocument: mediaAsDocument == 1}, mediaVoiceNote == 1)
+	}
+	if prepared != nil {
+		resp.Preview, resp.SizeBytes, resp.Note = prepared.Preview, prepared.SizeBytes, prepared.Note
+	}
+	if resp.Status == "draft" {
+		resp.ExpiresAt = createdAt + draftTTLSeconds
+		// Expiry is only written to the row when someone tries to confirm,
+		// so report it truthfully here instead of calling it a draft.
+		if time.Now().Unix() > resp.ExpiresAt {
+			resp.Status = "expired"
+		}
+		if up != nil && up.status != http.StatusOK {
+			resp.LastAttemptError = errorText(up.body)
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// errorText flattens a job's error body into one line.
+func errorText(body any) string {
+	if e, ok := body.(errorResponse); ok {
+		if e.Details != "" {
+			return e.Error + ": " + e.Details
+		}
+		return e.Error
+	}
+	return fmt.Sprint(body)
 }
 
 // --- Recipient resolution ---------------------------------------------------

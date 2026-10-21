@@ -14,16 +14,19 @@
 //      so all image/video/document/sticker/audio rows persist the fields
 //      needed to re-download later.
 //
-//   2. Bridge.DownloadMedia(ctx, messageID) — reads the persisted fields
-//      from the messages row, reconstitutes the right whatsmeow proto
-//      message, calls client.Download, writes bytes to the configured
-//      media folder, and updates messages.media_path. Idempotent.
+//   2. Bridge.DownloadMediaFile(ctx, messageID, job) — reads the persisted
+//      fields from the messages row, reconstitutes the right whatsmeow proto
+//      message, streams the decrypted file into the configured media folder,
+//      and updates messages.media_path. Idempotent. When WhatsApp's CDN has
+//      already dropped the file it asks the phone for it (media_retry.go).
 //
 //   3. Server.handleDownloadMedia — POST /api/media/download endpoint that
 //      lets the receipts pipeline (or any other Python consumer) materialize
 //      a single message's bytes on demand without flipping the global
 //      WHATSAPP_AUTO_DOWNLOAD_MEDIA flag (which would auto-download every
-//      media in every chat — unwanted blast radius for one workflow).
+//      media in every chat — unwanted blast radius for one workflow). Large
+//      files run as a job (jobs.go): the endpoint answers 202 while one is
+//      still downloading, and calling it again with the same id joins it.
 
 package main
 
@@ -41,11 +44,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types/events"
+	"golang.org/x/text/unicode/norm"
 )
 
 // mediaFields holds the persisted columns the bridge needs to re-download
@@ -59,6 +65,9 @@ type mediaFields struct {
 	MediaFileLength   sql.NullInt64
 	MediaKeyTimestamp sql.NullInt64
 	MediaMime         sql.NullString
+	// MediaFilename is the name the sender gave a document. Only documents
+	// carry one; see migrations/007_media_filename.sql.
+	MediaFilename sql.NullString
 }
 
 // downloadable is the minimum interface every media-bearing protobuf message
@@ -113,7 +122,13 @@ func extractDownloadableFields(evt *events.Message) (mediaFields, bool) {
 // outbound file is right after Upload, from the protobuf that carries them.
 // Mirrors the extractContent / extractContentFromProto split for the same
 // reason: one classifier, so a sent row and a received row cannot disagree.
+//
+// The message is unwrapped first. whatsmeow unwraps live events itself, but
+// history-sync messages arrive raw, and a document with a caption or any media
+// in a disappearing chat is nested one level down; without this those rows got
+// no keys at all. Unwrapping an already-unwrapped message is a no-op.
 func extractDownloadableFieldsFromProto(m *waE2E.Message) (mediaFields, bool) {
+	m = unwrapEnvelope(m)
 	if m == nil {
 		return mediaFields{}, false
 	}
@@ -124,7 +139,11 @@ func extractDownloadableFieldsFromProto(m *waE2E.Message) (mediaFields, bool) {
 		return fieldsFrom(x), true
 	}
 	if x := m.GetDocumentMessage(); x != nil {
-		return fieldsFrom(x), true
+		f := fieldsFrom(x)
+		if name := strings.TrimSpace(x.GetFileName()); name != "" {
+			f.MediaFilename = sql.NullString{String: name, Valid: true}
+		}
+		return f, true
 	}
 	if x := m.GetAudioMessage(); x != nil {
 		return fieldsFrom(x), true
@@ -135,70 +154,180 @@ func extractDownloadableFieldsFromProto(m *waE2E.Message) (mediaFields, bool) {
 	return mediaFields{}, false
 }
 
-// DownloadMedia fetches + decrypts the media bytes for a stored message,
-// writes them to the configured media folder, updates messages.media_path,
-// and returns the file path + mime + size.
+// errMediaGone marks a download that failed for good: WhatsApp's CDN no
+// longer has the file and the phone does not have it either.
+var errMediaGone = errors.New("WhatsApp ya no tiene este archivo en su servidor")
+
+// errPhoneUnreachable marks a download WhatsApp's CDN could not serve and the
+// phone did not supply this time — offline, slow, or the request did not get
+// through. Unlike errMediaGone it is worth trying again later.
+var errPhoneUnreachable = errors.New("WhatsApp ya no tiene este archivo en su servidor y el telefono no lo entrego")
+
+// downloadAttempts is how many times a download that fails is started over
+// from an empty file. whatsmeow retries network errors itself, but from the
+// start of the same file without truncating it, and its fallback to another
+// CDN host does not rewind at all — so a large download interrupted midway
+// ends in an integrity error instead of a retry. Starting clean recovers it.
+const downloadAttempts = 3
+
+// DownloadMediaFile fetches and decrypts the media of a stored message into
+// the configured media folder, records the path in messages.media_path, and
+// describes the file.
 //
-// Idempotent: if the message already has a non-NULL media_path that exists
-// on disk, returns the existing path without re-downloading.
-func (b *Bridge) DownloadMedia(ctx context.Context, messageID string) (path, mimeType string, size int64, err error) {
+// Idempotent: if the message already has a media_path that exists on disk,
+// that file is returned without downloading again.
+//
+// The file streams to disk. The previous version held the whole download in
+// a byte slice and then wrote it out, so the largest file it could handle was
+// bounded by memory, not by WhatsApp. job, when non-nil, receives progress.
+func (b *Bridge) DownloadMediaFile(ctx context.Context, messageID string, job *mediaJob) (downloadMediaResponse, error) {
 	var (
-		msgType                         string
-		mediaPath                       sql.NullString
-		mediaKey, mediaEncSha, mediaSha []byte
-		directPath, mediaURL, mediaMime sql.NullString
-		fileLength, mediaKeyTimestamp   sql.NullInt64
+		msgType, chatJID                   string
+		senderJID, senderDisplay, chatName string
+		isFromMe                           int
+		ts                                 int64
+		mediaPath, mediaFilename           sql.NullString
+		mediaKey, mediaEncSha, mediaSha    []byte
+		directPath, mediaURL, mediaMime    sql.NullString
+		fileLength, mediaKeyTimestamp      sql.NullInt64
 	)
-	row := b.db.QueryRowContext(ctx, `
-		SELECT type, media_path, media_key, media_direct_path, media_url,
-		       media_enc_sha256, media_sha256, media_file_length,
-		       media_key_timestamp, media_mime
-		FROM messages WHERE id = ?
-	`, messageID)
-	if err = row.Scan(&msgType, &mediaPath,
-		&mediaKey, &directPath, &mediaURL,
+	err := b.db.QueryRowContext(ctx, `
+		SELECT m.type, m.chat_jid, COALESCE(m.sender_jid, ''), COALESCE(m.sender_display, ''),
+		       COALESCE(c.name, ''), m.is_from_me, m.timestamp,
+		       m.media_path, m.media_filename, m.media_key, m.media_direct_path, m.media_url,
+		       m.media_enc_sha256, m.media_sha256, m.media_file_length,
+		       m.media_key_timestamp, m.media_mime
+		FROM messages m LEFT JOIN chats c ON c.jid = m.chat_jid
+		WHERE m.id = ?
+	`, messageID).Scan(&msgType, &chatJID, &senderJID, &senderDisplay,
+		&chatName, &isFromMe, &ts,
+		&mediaPath, &mediaFilename, &mediaKey, &directPath, &mediaURL,
 		&mediaEncSha, &mediaSha, &fileLength,
-		&mediaKeyTimestamp, &mediaMime); err != nil {
+		&mediaKeyTimestamp, &mediaMime)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", "", 0, fmt.Errorf("message not found: %s", messageID)
+			return downloadMediaResponse{}, fmt.Errorf("message not found: %s", messageID)
 		}
-		return "", "", 0, fmt.Errorf("query message: %w", err)
+		return downloadMediaResponse{}, fmt.Errorf("query message: %w", err)
 	}
 
 	mt := ""
 	if mediaMime.Valid {
 		mt = mediaMime.String
 	}
+	resp := downloadMediaResponse{
+		MessageID:     messageID,
+		Mime:          mt,
+		Type:          msgType,
+		ChatJID:       chatJID,
+		ChatName:      chatName,
+		SenderJID:     senderJID,
+		SenderDisplay: senderDisplay,
+		IsFromMe:      isFromMe == 1,
+		Timestamp:     ts,
+	}
+	resp.Filename, resp.OriginalFilename = displayFilename(mediaFilename.String, msgType, mt, ts)
 
 	// Idempotent fast-path: already downloaded and file still exists.
 	if mediaPath.Valid && mediaPath.String != "" {
 		if st, statErr := os.Stat(mediaPath.String); statErr == nil && !st.IsDir() {
-			return mediaPath.String, mt, st.Size(), nil
+			resp.Path, resp.Size, resp.CachedHit = mediaPath.String, st.Size(), true
+			return resp, nil
+		}
+	}
+
+	// The row's path can be stale while the file sits right here. Rows carried
+	// over from the Windows deployment point at C:\Users\..., so every file
+	// downloaded there was fetched from WhatsApp again after the move — and
+	// for older messages WhatsApp answered 404 although the bytes were on this
+	// disk (three of the failures in the audit log as of 2026-10-21). This is
+	// where the file would be if this machine had downloaded it, so look here
+	// before asking WhatsApp for bytes it may no longer have.
+	if found := b.findLocalMedia(messageID); found != "" {
+		if st, statErr := os.Stat(found); statErr == nil {
+			if _, perr := b.db.ExecContext(ctx,
+				`UPDATE messages SET media_path = ? WHERE id = ?`, found, messageID); perr != nil {
+				log.Printf("DownloadMediaFile: repointing media_path for %s failed: %v", messageID, perr)
+			}
+			resp.Path, resp.Size, resp.CachedHit = found, st.Size(), true
+			return resp, nil
 		}
 	}
 
 	if len(mediaKey) == 0 {
-		return "", "", 0, fmt.Errorf("media key not available for message %s (likely received before media-key persistence patch)", messageID)
+		return resp, fmt.Errorf("media key not available for message %s (likely received before media-key persistence patch)", messageID)
 	}
 
 	dl, err := buildDownloadable(msgType, mediaKey, mediaEncSha, mediaSha,
 		mediaURL, directPath, fileLength, mediaKeyTimestamp, mt)
 	if err != nil {
-		return "", "", 0, err
-	}
-
-	bytes, err := b.client.Download(ctx, dl)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("whatsmeow download: %w", err)
+		return resp, err
 	}
 
 	if err := os.MkdirAll(b.cfg.MediaPath, 0o700); err != nil {
-		return "", "", 0, fmt.Errorf("mkdir media path: %w", err)
+		return resp, fmt.Errorf("mkdir media path: %w", err)
 	}
-	ext := extensionForMime(mt, msgType)
-	outPath := filepath.Join(b.cfg.MediaPath, safeMediaStem(messageID)+ext)
-	if err := os.WriteFile(outPath, bytes, 0o600); err != nil {
-		return "", "", 0, fmt.Errorf("write media file: %w", err)
+	outPath := filepath.Join(b.cfg.MediaPath, safeMediaStem(messageID)+extensionForMime(mt, msgType))
+	// Bytes land in a .part file and are renamed into place only once they
+	// decrypt and verify, so a reader can never pick up half a file under
+	// the final name. The Remove is a no-op after the rename.
+	part := outPath + ".part"
+	defer os.Remove(part)
+
+	// written only ever grows, so it shows activity even while a retry is
+	// re-covering bytes the file already holds; the file's size, which is
+	// what pollers see as progress, stays flat during that stretch.
+	written := new(atomic.Int64)
+	if job != nil {
+		job.bytesTotal.Store(fileLength.Int64)
+		job.progressFile.Store(part)
+		written = &job.moves
+	}
+	job.setPhase("descargando de WhatsApp")
+	err = b.downloadWithRetries(ctx, dl, part, written, job)
+
+	if isExpiredMedia(err) {
+		cdnErr := err
+		job.setPhase("WhatsApp ya no lo tiene; pidiendoselo al telefono")
+		info, ierr := messageInfoForRetry(messageID, chatJID, senderJID, isFromMe == 1)
+		if ierr != nil {
+			return resp, fmt.Errorf("%w (%v) y no se puede pedir al telefono: %v", errMediaGone, cdnErr, ierr)
+		}
+		newPath, rerr := b.requestMediaReupload(ctx, info, mediaKey)
+		if errors.Is(rerr, errNotOnPhone) {
+			return resp, fmt.Errorf("%w (%v), y %v", errMediaGone, cdnErr, rerr)
+		}
+		if rerr != nil {
+			return resp, fmt.Errorf("%w (%v): %v", errPhoneUnreachable, cdnErr, rerr)
+		}
+		// Recorded straight away, so if the second attempt fails for some
+		// unrelated reason the next one starts from the fresh path instead of
+		// asking the phone again. The old URL points at the dropped copy.
+		if _, perr := b.db.ExecContext(ctx,
+			`UPDATE messages SET media_direct_path = ?, media_url = NULL WHERE id = ?`,
+			newPath, messageID); perr != nil {
+			log.Printf("DownloadMediaFile: persisting the re-uploaded path for %s failed: %v", messageID, perr)
+		}
+		dl, err = buildDownloadable(msgType, mediaKey, mediaEncSha, mediaSha,
+			sql.NullString{}, sql.NullString{String: newPath, Valid: true},
+			fileLength, mediaKeyTimestamp, mt)
+		if err != nil {
+			return resp, err
+		}
+		job.setPhase("descargando de WhatsApp")
+		err = b.downloadWithRetries(ctx, dl, part, written, job)
+		resp.RecoveredFromPhone = err == nil
+	}
+	if err != nil {
+		return resp, fmt.Errorf("whatsmeow download: %w", err)
+	}
+
+	if err := os.Rename(part, outPath); err != nil {
+		return resp, fmt.Errorf("write media file: %w", err)
+	}
+	st, err := os.Stat(outPath)
+	if err != nil {
+		return resp, fmt.Errorf("write media file: %w", err)
 	}
 
 	if _, perr := b.db.ExecContext(ctx,
@@ -206,10 +335,99 @@ func (b *Bridge) DownloadMedia(ctx context.Context, messageID string) (path, mim
 		outPath, sql.NullString{String: mt, Valid: mt != ""}, messageID,
 	); perr != nil {
 		// Bytes are on disk; persistence is best-effort. Log + continue.
-		log.Printf("DownloadMedia: persist media_path failed for %s: %v", messageID, perr)
+		log.Printf("DownloadMediaFile: persist media_path failed for %s: %v", messageID, perr)
 	}
 
-	return outPath, mt, int64(len(bytes)), nil
+	resp.Path, resp.Size = outPath, st.Size()
+	return resp, nil
+}
+
+// findLocalMedia returns a finished download of the message already in the
+// media folder, or "". It matches on the name stem alone: the extension
+// depends on the OS that did the download (Windows maps image/jpeg to .jfif
+// and some JSON types to .dtsconfig), so recomputing it here would miss them.
+func (b *Bridge) findLocalMedia(messageID string) string {
+	stem := safeMediaStem(messageID)
+	// The stem is limited to [A-Za-z0-9._-], none of which Glob treats as a
+	// pattern, so the only wildcard is the one added here.
+	matches, _ := filepath.Glob(filepath.Join(b.cfg.MediaPath, stem+".*"))
+	for _, m := range matches {
+		rest := strings.TrimPrefix(filepath.Base(m), stem)
+		// ".part" is an unfinished download; anything with a second dot
+		// (".voice.ogg", a transcode) belongs to another file.
+		if rest == ".part" || strings.Count(rest, ".") != 1 {
+			continue
+		}
+		if st, err := os.Stat(m); err == nil && st.Mode().IsRegular() && st.Size() > 0 {
+			return m
+		}
+	}
+	return ""
+}
+
+// downloadWithRetries runs downloadToFile up to downloadAttempts times,
+// starting from an empty file each time. Expired media is not retried — that
+// takes a phone, not another attempt — and neither is a cancelled download.
+func (b *Bridge) downloadWithRetries(ctx context.Context, dl whatsmeow.DownloadableMessage, path string, written *atomic.Int64, job *mediaJob) error {
+	var err error
+	for attempt := 1; attempt <= downloadAttempts; attempt++ {
+		err = b.downloadToFile(ctx, dl, path, written)
+		if err == nil || isExpiredMedia(err) || ctx.Err() != nil || errors.Is(err, whatsmeow.ErrNoURLPresent) {
+			return err
+		}
+		if attempt < downloadAttempts {
+			log.Printf("download attempt %d of %d failed, starting over: %v", attempt, downloadAttempts, err)
+			job.setPhase(fmt.Sprintf("reintentando la descarga (%d de %d)", attempt+1, downloadAttempts))
+			select {
+			case <-time.After(time.Duration(attempt) * 3 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return err
+}
+
+// downloadToFile streams one attachment into path, replacing whatever a
+// previous attempt left there. Every byte written is added to written.
+func (b *Bridge) downloadToFile(ctx context.Context, dl whatsmeow.DownloadableMessage, path string, written *atomic.Int64) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open media file: %w", err)
+	}
+	defer f.Close()
+	return b.client.DownloadToFile(ctx, dl, growingFile{File: f, written: written})
+}
+
+// growingFile hides that it is an *os.File, and counts what is written to it.
+//
+// Hidden because whatsmeow preallocates the full length when handed an
+// *os.File, which would make the file's size — the progress a poller sees —
+// jump to 100% before the first byte arrives. Behind this wrapper the file
+// grows as the download does. Counted because the size alone cannot show a
+// retry rewriting the start of the file, which watchStall must not mistake
+// for a stall.
+type growingFile struct {
+	*os.File
+	written *atomic.Int64
+}
+
+func (g growingFile) Write(p []byte) (int, error) {
+	n, err := g.File.Write(p)
+	g.written.Add(int64(n))
+	return n, err
+}
+
+func (g growingFile) WriteAt(p []byte, off int64) (int, error) {
+	n, err := g.File.WriteAt(p, off)
+	g.written.Add(int64(n))
+	return n, err
+}
+
+// ReadFrom is overridden so io.Copy cannot reach *os.File's own ReadFrom,
+// which would write without passing through Write and go uncounted.
+func (g growingFile) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(struct{ io.Writer }{g}, r)
 }
 
 // buildDownloadable reconstitutes the right whatsmeow proto message for the
@@ -364,12 +582,34 @@ type downloadMediaResponse struct {
 	Mime      string `json:"mime,omitempty"`
 	Size      int64  `json:"size"`
 	CachedHit bool   `json:"cached_hit,omitempty"`
+
+	// What a caller needs to name, file or show the download without a second
+	// query: a copy saved to Drive is named after Filename, and a download
+	// link serves it under that name.
+	Filename string `json:"filename"`
+	// OriginalFilename is false when Filename was generated, which is always
+	// the case for photos, videos and voice notes, and for documents stored
+	// before migration 007.
+	OriginalFilename   bool   `json:"original_filename"`
+	Type               string `json:"type"`
+	ChatJID            string `json:"chat_jid"`
+	ChatName           string `json:"chat_name,omitempty"`
+	SenderJID          string `json:"sender_jid,omitempty"`
+	SenderDisplay      string `json:"sender_display,omitempty"`
+	IsFromMe           bool   `json:"is_from_me"`
+	Timestamp          int64  `json:"timestamp"`
+	RecoveredFromPhone bool   `json:"recovered_from_phone,omitempty"`
 }
 
 // handleDownloadMedia fetches + decrypts media bytes for a single message
 // and persists them under the bridge's media folder. The Python pipeline
 // (receipts watcher) calls this after seeing a new image/document in
 // list_messages to materialize the file before sending to vision.
+//
+// The download runs as a job. A file that arrives within the wait is answered
+// exactly as before; a larger one gets 202 with progress, and calling again
+// with the same message_id joins the running download instead of starting a
+// second one. Once it lands, the next call takes the fast path above.
 func (s *Server) handleDownloadMedia(w http.ResponseWriter, r *http.Request) {
 	type req struct {
 		MessageID string `json:"message_id"`
@@ -383,38 +623,145 @@ func (s *Server) handleDownloadMedia(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "message_id required"})
 		return
 	}
-
-	var preMediaPath sql.NullString
-	_ = s.db.QueryRowContext(r.Context(),
-		`SELECT media_path FROM messages WHERE id = ?`,
-		body.MessageID,
-	).Scan(&preMediaPath)
-
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
-
-	path, mt, size, err := s.bridge.DownloadMedia(ctx, body.MessageID)
-	if err != nil {
-		errMsg := err.Error()
-		switch {
-		case strings.Contains(errMsg, "message not found"),
-			strings.Contains(errMsg, "media key not available"),
-			strings.Contains(errMsg, "is not downloadable"):
-			writeJSON(w, http.StatusNotFound, errorResponse{Error: errMsg})
-		default:
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "download failed", Details: errMsg})
-		}
+	if s.bridge == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "bridge not ready"})
 		return
 	}
 
-	cached := preMediaPath.Valid && preMediaPath.String == path && size > 0
-	writeJSON(w, http.StatusOK, downloadMediaResponse{
-		MessageID: body.MessageID,
-		Path:      path,
-		Mime:      mt,
-		Size:      size,
-		CachedHit: cached,
+	key := "download:" + body.MessageID
+	j, _ := s.jobs().start(key, func(j *mediaJob) (int, any) {
+		ctx, cancel := context.WithTimeout(s.rootContext(), mediaJobTimeout)
+		defer cancel()
+		stop, stalled := watchStall(cancel, j.activity, stallTimeout)
+		resp, err := s.bridge.DownloadMediaFile(ctx, body.MessageID, j)
+		stop()
+		// The outcome is in the messages table now (or the failure is worth
+		// retrying), so the next request should start fresh rather than be
+		// handed this job's answer.
+		s.jobs().forget(key, j)
+		if err != nil {
+			if stalled.Load() {
+				err = fmt.Errorf("la descarga se detuvo: no llegaron datos en %s", stallTimeout)
+			}
+			return downloadErrorStatus(err), downloadErrorBody(err)
+		}
+		return http.StatusOK, resp
 	})
+	answerJob(w, r, j, jobPending{
+		MessageID: body.MessageID,
+		Status:    "downloading",
+		Hint:      "sigue descargando; vuelve a pedir el mismo message_id para obtener el archivo",
+	})
+}
+
+// downloadErrorStatus keeps the statuses callers already rely on: 404 for a
+// message that has nothing to download, 410 for media WhatsApp no longer has,
+// 500 for everything else.
+func downloadErrorStatus(err error) int {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "message not found"),
+		strings.Contains(msg, "media key not available"),
+		strings.Contains(msg, "is not downloadable"):
+		return http.StatusNotFound
+	case errors.Is(err, errMediaGone):
+		return http.StatusGone
+	case errors.Is(err, errPhoneUnreachable):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func downloadErrorBody(err error) errorResponse {
+	switch downloadErrorStatus(err) {
+	case http.StatusNotFound:
+		return errorResponse{Error: err.Error()}
+	case http.StatusGone:
+		return errorResponse{
+			Error:   "media no longer available",
+			Details: err.Error() + ". Pidele a quien lo envio que lo mande otra vez.",
+		}
+	case http.StatusServiceUnavailable:
+		return errorResponse{
+			Error:   "phone did not supply the media",
+			Details: err.Error() + ". Vuelve a intentarlo con el telefono encendido y con internet.",
+		}
+	default:
+		return errorResponse{Error: "download failed", Details: err.Error()}
+	}
+}
+
+// mediaTypeLabels name a generated file after what it is, in the user's
+// language.
+var mediaTypeLabels = map[string]string{
+	"image":    "Imagen",
+	"video":    "Video",
+	"audio":    "Audio",
+	"voice":    "Nota de voz",
+	"document": "Documento",
+	"sticker":  "Sticker",
+}
+
+// displayFilename returns the name to show for a message's media and whether
+// it is the sender's own. Documents carry a name; photos, videos and voice
+// notes never do, so they are named like WhatsApp names them on export — what
+// they are plus when — which also sorts sensibly in a folder.
+func displayFilename(stored, msgType, mimeType string, ts int64) (string, bool) {
+	ext := extensionForMime(mimeType, msgType)
+	if name := cleanMediaFilename(stored); name != "" {
+		if filepath.Ext(name) == "" {
+			name += ext
+		}
+		return name, true
+	}
+	label := mediaTypeLabels[msgType]
+	if label == "" {
+		label = "Archivo"
+	}
+	return label + " " + time.Unix(ts, 0).Local().Format("2006-01-02 15.04.05") + ext, false
+}
+
+// maxFilenameBytes keeps names well inside every filesystem's 255-byte limit,
+// with room for the " (2)" a Drive copy may need.
+const maxFilenameBytes = 180
+
+// cleanMediaFilename makes a sender-chosen name safe to use as a filename on
+// any OS and in a Content-Disposition header. The name is attacker-chosen
+// text: anyone can send a document called "../../.bashrc". Path separators and
+// the characters Windows refuses become "_", control characters are dropped,
+// leading and trailing dots and spaces are trimmed, and the result is bounded.
+// Returns "" when nothing usable is left.
+//
+// Not export_vault.go's sanitizeFilename: that one builds vault note names and
+// also rewrites brackets and percent signs, which a document name the user
+// will recognise should keep. Both fold to NFC, for the reason given there.
+func cleanMediaFilename(name string) string {
+	var b strings.Builder
+	for _, r := range norm.NFC.String(name) {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			// Dropped: a newline in a filename is never intended.
+		case strings.ContainsRune(`/\:*?"<>|`, r):
+			b.WriteRune('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	s := strings.Trim(b.String(), ". ")
+	if len(s) > maxFilenameBytes {
+		ext := filepath.Ext(s)
+		if len(ext) > 16 {
+			ext = ""
+		}
+		stem := s[:len(s)-len(ext)]
+		n := maxFilenameBytes - len(ext)
+		for n > 0 && !utf8.RuneStart(stem[n]) {
+			n--
+		}
+		s = strings.TrimRight(stem[:n], ". ") + ext
+	}
+	return s
 }
 
 // safeMediaStem reduces a WhatsApp message ID to a filename component that

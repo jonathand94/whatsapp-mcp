@@ -50,27 +50,16 @@ import (
 // extractFromMessage is the inner-type variant of extractDownloadableFields.
 // Live receive (events.Message) wraps the proto in evt.Message; HistorySync
 // delivery wraps it in HistorySyncMsg.GetMessage().GetMessage(). Both reach
-// the same *waE2E.Message, so both paths share this helper.
+// the same *waE2E.Message, so both paths share one extractor.
+//
+// It used to be a copy of that extractor, minus the envelope unwrapping that
+// whatsmeow only does for live events. A history-sync document with a
+// caption, or any media in a disappearing chat, arrives wrapped — so its row
+// got type 'document' from the content decoder (which does unwrap) and no
+// media keys from here, and download_media failed on it with "media key not
+// available". Delegating keeps the two from drifting again.
 func extractFromMessage(m *waE2E.Message) (mediaFields, bool) {
-	if m == nil {
-		return mediaFields{}, false
-	}
-	if mm := m.GetImageMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	if mm := m.GetVideoMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	if mm := m.GetDocumentMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	if mm := m.GetAudioMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	if mm := m.GetStickerMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	return mediaFields{}, false
+	return extractDownloadableFieldsFromProto(m)
 }
 
 // processHistorySyncEvent updates messages.media_key for any rows currently
@@ -186,14 +175,14 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			// so a backfilled row is indistinguishable from a live one.
 			res, err := b.db.Exec(`
 				INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
-					media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+					media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, media_filename)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT(id) DO NOTHING
 			`, key.GetID(), chatJID, senderJID, senderDisplay, ts, msgType, content, normalized,
 				boolToInt(fromMe), scrubbed, ScrubFlagsJSON(flags),
 				mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
 				mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
-				mfields.MediaKeyTimestamp, mfields.MediaMime)
+				mfields.MediaKeyTimestamp, mfields.MediaMime, mfields.MediaFilename)
 			if err != nil {
 				log.Printf("history_sync: insert %s failed: %v", key.GetID(), err)
 				continue
@@ -227,6 +216,19 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				continue
 			}
 			mediaSeen++
+
+			// Rows stored before migration 007 have their keys but no
+			// document name, so the keys-only UPDATE below skips them. A
+			// re-delivered document is the only chance to recover the name
+			// the sender gave it.
+			if fields.MediaFilename.Valid {
+				if _, err := b.db.Exec(`
+					UPDATE messages SET media_filename = ?
+					 WHERE id = ? AND media_filename IS NULL
+				`, fields.MediaFilename, key.GetID()); err != nil {
+					log.Printf("history_sync: filename backfill %s failed: %v", key.GetID(), err)
+				}
+			}
 			ures, err := b.db.Exec(`
 				UPDATE messages
 				   SET media_key            = COALESCE(media_key, ?),

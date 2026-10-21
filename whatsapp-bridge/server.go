@@ -30,6 +30,21 @@ type Server struct {
 	// bare field read — see the note on that method for why.
 	governor *sendGovernor
 	govOnce  sync.Once
+
+	// Long media work (jobs.go). Reached through s.jobs() for the same reason
+	// the governor is: tests build Server as a bare literal.
+	jobTbl  *jobTable
+	jobOnce sync.Once
+}
+
+// jobs returns the job table, building it on first use.
+func (s *Server) jobs() *jobTable {
+	s.jobOnce.Do(func() {
+		if s.jobTbl == nil {
+			s.jobTbl = newJobTable()
+		}
+	})
+	return s.jobTbl
 }
 
 func NewServer(cfg *Config, db *sql.DB, bridge *Bridge, backfiller *TranscriptBackfiller) *Server {
@@ -64,6 +79,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/groups", s.handleListGroups)
 
 	s.mux.HandleFunc("POST /api/sends", s.handleCreateDraft)
+	s.mux.HandleFunc("GET /api/sends/{draft_id}", s.handleSendStatus)
 	s.mux.HandleFunc("POST /api/sends/{draft_id}/confirm", s.handleConfirmSend)
 
 	s.mux.HandleFunc("POST /api/presence/mark_read", s.handleMarkRead)

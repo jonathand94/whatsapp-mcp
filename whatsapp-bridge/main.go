@@ -245,6 +245,12 @@ func run() int {
 		log.Printf("in-flight send reconciliation: %d interrupted send(s) marked failed (NOT resent)", n)
 	}
 
+	// Free what drafts leave on disk: the previous run's scratch files now,
+	// before serving (after that a new draft's partial file looks the same),
+	// and abandoned drafts now and hourly. See outbound_sweep.go.
+	server.removeOrphans()
+	go server.runOutboundSweeper(ctx)
+
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

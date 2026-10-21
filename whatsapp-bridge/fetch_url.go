@@ -20,10 +20,14 @@
 //  4. text/html is refused. Drive answers a login page with 200 OK for a file
 //     that is not public; without this the recipient receives that page
 //     dressed up as a photo.
+//
+// The body streams to the caller's writer rather than into memory, so a URL
+// can carry anything up to WhatsApp's 2 GB document ceiling.
 
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -37,6 +41,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,7 +50,10 @@ const (
 	// or three — and stops well short of a redirect loop.
 	maxFetchRedirects = 5
 
-	fetchTotalTimeout  = 3 * time.Minute // a 100 MB document on a slow link
+	// fetchTotalTimeout is a backstop for the whole download, sized for 2 GB
+	// over a slow link. A download that stops moving is abandoned long before
+	// it, after stallTimeout (jobs.go).
+	fetchTotalTimeout  = mediaJobTimeout
 	fetchDialTimeout   = 15 * time.Second
 	fetchHeaderTimeout = 30 * time.Second
 
@@ -247,7 +255,9 @@ var driveFileIDRE = regexp.MustCompile(`/file/d/([A-Za-z0-9_-]{10,})`)
 // would be a page of HTML. The older /uc?export=download endpoint serves the
 // file but answers with an antivirus interstitial once the file is beyond a few
 // megabytes — also HTML, also not the file. drive.usercontent.google.com skips
-// both. Anything that is not a Drive link is returned untouched.
+// both, except that it too stops at a "can't scan this file for viruses" page
+// for files of roughly 100 MB and up; confirm=t is the answer to that page,
+// sent up front. Anything that is not a Drive link is returned untouched.
 func normalizeDriveURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -268,35 +278,39 @@ func normalizeDriveURL(raw string) string {
 	if id == "" {
 		return raw
 	}
-	return "https://drive.usercontent.google.com/download?id=" + url.QueryEscape(id) + "&export=download"
+	return "https://drive.usercontent.google.com/download?id=" + url.QueryEscape(id) + "&export=download&confirm=t"
 }
 
-// fetchRemoteFile downloads a URL into memory and reports the bytes plus the
-// best name it could find for them.
+// fetchRemoteFileTo downloads a URL into dst and reports the best name it
+// could find for the bytes, plus how many there were.
 //
 // maxBytes is the ceiling applied while reading. It is the most permissive
 // limit that could apply to this draft, not the exact one: the exact limit
 // depends on the content type, which is not known until the bytes are in hand.
-// checkSizeLimit applies that afterwards, so a 20 MB download that turns out to
-// be an image is still rejected — just after arriving rather than before.
+// planDelivery applies that afterwards.
 //
-// Buffering in memory rather than streaming to disk matches what file_path
-// already does, and keeps the "nothing is written until the input is accepted"
-// property that the draft flow depends on.
-func fetchRemoteFile(ctx context.Context, rawURL string, maxBytes int64, f fetcher) ([]byte, string, error) {
+// dst receives the body as it arrives, so it may hold a partial download when
+// this returns an error. The draft flow writes into a .part file it deletes
+// on any error, which is what keeps its "nothing is accepted until the input
+// is" property now that the body no longer fits in memory.
+//
+// job, when non-nil, learns the expected size from Content-Length.
+func fetchRemoteFileTo(ctx context.Context, rawURL string, maxBytes int64, f fetcher, dst io.Writer, job *mediaJob) (string, int64, error) {
 	target := normalizeDriveURL(strings.TrimSpace(rawURL))
 
 	u, err := url.Parse(target)
 	if err != nil {
-		return nil, "", fmt.Errorf("file_url no es una URL valida: %w", err)
+		return "", 0, fmt.Errorf("file_url no es una URL valida: %w", err)
 	}
 	if err := validateFetchURL(u, f.policy); err != nil {
-		return nil, "", err
+		return "", 0, err
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("file_url no se pudo preparar: %w", err)
+		return "", 0, fmt.Errorf("file_url no se pudo preparar: %w", err)
 	}
 	req.Header.Set("User-Agent", fetchUserAgent)
 
@@ -304,41 +318,68 @@ func fetchRemoteFile(ctx context.Context, rawURL string, maxBytes int64, f fetch
 	if err != nil {
 		// url.Error wraps whatever the guard returned, so errors.Is still finds
 		// errBlockedTarget through it.
-		return nil, "", fmt.Errorf("no se pudo descargar file_url: %w", err)
+		return "", 0, fmt.Errorf("no se pudo descargar file_url: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("file_url respondio %s", resp.Status)
+		return "", 0, fmt.Errorf("file_url respondio %s", resp.Status)
 	}
 	if isHTML(resp.Header.Get("Content-Type")) {
-		return nil, "", errHTMLBody
+		return "", 0, errHTMLBody
 	}
 
 	// Content-Length is worth a cheap early rejection and never worth trusting
 	// as the enforcement point: it can be absent under chunked encoding, and it
 	// can simply be wrong. It is -1 when unknown, so this comparison is safe.
 	if resp.ContentLength > maxBytes {
-		return nil, "", fmt.Errorf(
+		return "", 0, fmt.Errorf(
 			"file_url declara %d bytes y el maximo es %d", resp.ContentLength, maxBytes)
+	}
+	if job != nil && resp.ContentLength > 0 {
+		job.bytesTotal.Store(resp.ContentLength)
+	}
+
+	// Watched from the first byte: a server that sends its headers and then
+	// nothing would otherwise hold the draft until the 8-hour backstop. The
+	// count sits on the raw body, under the buffer, so it measures what the
+	// network delivers rather than what this function has consumed.
+	var moved atomic.Int64
+	stop, stalled := watchStall(cancel, moved.Load, stallTimeout)
+	defer stop()
+	stallErr := func() error {
+		return fmt.Errorf("la descarga de file_url se detuvo: no llegaron datos en %s", stallTimeout)
+	}
+
+	// A server that sent no Content-Type gets sniffed, so the HTML check cannot
+	// be sidestepped by omitting the header. Peeking keeps the sniffed bytes in
+	// the stream, and keeps an HTML page from ever reaching dst.
+	body := bufio.NewReaderSize(&progressReader{r: resp.Body, n: &moved}, 4096)
+	head, peekErr := body.Peek(512)
+	if peekErr != nil && peekErr != io.EOF {
+		if stalled.Load() {
+			return "", 0, stallErr()
+		}
+		return "", 0, fmt.Errorf("descargando file_url: %w", peekErr)
+	}
+	if len(head) == 0 {
+		return "", 0, fmt.Errorf("file_url devolvio un archivo vacio")
+	}
+	if isHTML(http.DetectContentType(head)) {
+		return "", 0, errHTMLBody
 	}
 
 	// Read one byte past the ceiling: getting it back is the proof the body was
 	// over the limit, whatever the headers said.
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	n, err := io.Copy(dst, io.LimitReader(body, maxBytes+1))
 	if err != nil {
-		return nil, "", fmt.Errorf("descargando file_url: %w", err)
+		if stalled.Load() {
+			return "", n, stallErr()
+		}
+		return "", n, fmt.Errorf("descargando file_url: %w", err)
 	}
-	if int64(len(data)) > maxBytes {
-		return nil, "", fmt.Errorf("file_url supera el maximo de %d bytes", maxBytes)
-	}
-	if len(data) == 0 {
-		return nil, "", fmt.Errorf("file_url devolvio un archivo vacio")
-	}
-	// A server that sent no Content-Type gets sniffed, so the HTML check cannot
-	// be sidestepped by omitting the header.
-	if isHTML(http.DetectContentType(data)) {
-		return nil, "", errHTMLBody
+	if n > maxBytes {
+		return "", n, fmt.Errorf("file_url supera el maximo de %d bytes", maxBytes)
 	}
 
 	// Name from where the bytes actually came, not where the request started: a
@@ -348,7 +389,21 @@ func fetchRemoteFile(ctx context.Context, rawURL string, maxBytes int64, f fetch
 	if resp.Request != nil && resp.Request.URL != nil {
 		named = resp.Request.URL
 	}
-	return data, fetchNameHint(resp, named), nil
+	return fetchNameHint(resp, named), n, nil
+}
+
+// progressReader counts bytes as they are read, for the stall watch. The
+// job's own progress is counted by whatever dst the caller passed, so it is
+// not counted here as well.
+type progressReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.n.Add(int64(n))
+	return n, err
 }
 
 func isHTML(contentType string) bool {
