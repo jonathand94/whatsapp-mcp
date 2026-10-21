@@ -390,22 +390,43 @@ async def _bridge_post(path: str, body: dict[str, Any]) -> Any:
 
 
 @mcp.tool()
-async def healthcheck() -> dict[str, Any]:
+async def healthcheck(detail: bool = False) -> dict[str, Any]:
     """Check the Go bridge is running and authenticated.
-    Returns status, schema version, and feature flags.
 
-    status_detail.auth_state explains pairing: "qr_pending" → the user must
-    scan the QR (or POST /api/auth/pair-phone on the bridge for a typed
-    code); "logged_out" → WhatsApp revoked the session and the bridge is
-    already re-entering pairing; "paired" → healthy. Read tools also attach
-    a _bridge_state envelope so cached data is distinguishable from live.
+    By default a short answer: whether WhatsApp is connected and paired, and
+    the send budget (messages left this hour and day, new conversations left,
+    and when the next new-conversation slot frees up). It answers at once.
+
+    detail=True adds the full report — schema version, feature flags,
+    message and decoding counters — which walks the whole database and can
+    take half a minute after a restart. Ask for it only when diagnosing.
+
+    auth_state explains pairing: "qr_pending" → the user must scan the QR (or
+    POST /api/auth/pair-phone on the bridge for a typed code); "logged_out" →
+    WhatsApp revoked the session and the bridge is already re-entering
+    pairing; "paired" → healthy. Read tools also attach a _bridge_state
+    envelope so cached data is distinguishable from live.
     """
     start = time.time()
     try:
-        result = await _bridge_get("/healthcheck")
         status = await _bridge_get("/api/status")
+        if not detail:
+            # The full report repeats this and adds counters most callers
+            # never read, at the cost of a database walk and thousands of
+            # tokens; the 2026-10-21 test run asked for exactly this split.
+            summary = {
+                "connected": status.get("connected"),
+                "authenticated": status.get("authenticated"),
+                "auth_state": status.get("auth_state"),
+                "device_jid": status.get("device_jid"),
+                "send_budget": status.get("send_budget"),
+                "hint": "detail=true devuelve el reporte completo (tarda mas)",
+            }
+            _audit("healthcheck", {}, "ok (summary)", int((time.time() - start) * 1000))
+            return summary
+        result = await _bridge_get("/healthcheck")
         merged = {**result, "status_detail": status}
-        _audit("healthcheck", {}, "ok", int((time.time() - start) * 1000))
+        _audit("healthcheck", {"detail": True}, "ok", int((time.time() - start) * 1000))
         return merged
     except Exception as e:  # noqa: BLE001
         _audit("healthcheck", {}, "failed", int((time.time() - start) * 1000), error=str(e))
@@ -434,8 +455,12 @@ async def list_chats(limit: int = 20, offset: int = 0, unread_only: bool = False
 
 @mcp.tool()
 async def search_contacts(query: str, limit: int = 10) -> dict[str, Any]:
-    """Find contacts by name or phone number. Accent-insensitive.
+    """Find people by name or phone number. Accent-insensitive.
     "Muñoz" matches "munoz", "José" matches "jose", "Zürich" matches "zurich".
+
+    One entry per person: their other JIDs (phone and @lid forms) are listed
+    under aliases, and any of them works with list_messages or send_message.
+    This searches people only; to find a group by its name use search_chats.
     """
     start = time.time()
     params = {"q": query, "limit": limit}
@@ -448,25 +473,68 @@ async def search_contacts(query: str, limit: int = 10) -> dict[str, Any]:
         raise
 
 
+def _to_unix(value: str, end_of_day: bool) -> int:
+    """A date, date-time or unix timestamp as unix seconds, in this machine's
+    time zone. A bare date as an upper bound means the end of that day."""
+    from datetime import datetime, timedelta
+
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            moment = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if fmt == "%Y-%m-%d" and end_of_day:
+            moment += timedelta(days=1, seconds=-1)
+        return int(moment.timestamp())
+    raise ValueError(f"fecha no reconocida: {value!r}; usa 2026-10-21, 2026-10-21 14:30 o un timestamp unix")
+
+
 @mcp.tool()
 async def list_messages(
     chat_jid: str,
     limit: int = 20,
     before: str | None = None,
     include_crm_context: bool = True,
+    media_type: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    from_me: bool | None = None,
 ) -> dict[str, Any]:
     """List messages in a chat. Most recent first by default.
 
+    Media messages carry filename (the sender's name for a document), mime and
+    size, so the right attachment can be picked without downloading each one.
+
     Args:
-        chat_jid: The JID of the chat (from list_chats or search_contacts).
+        chat_jid: The JID of the chat (from list_chats, search_chats or search_contacts).
         limit: Max messages (default 20, max 500).
         before: Return messages older than this message ID (pagination).
         include_crm_context: When true and WHATSAPP_VAULT_CRM_PATH is set, the response includes a `crm_context` block with the matching vault CRM note summary.
+        media_type: Only messages of this kind: image, video, audio (voice
+                    notes included), voice, document, sticker, or media (any
+                    of those).
+        since: Only messages from this moment on: a date ("2026-10-01"), a
+               date and time ("2026-10-01 14:30"), or a unix timestamp.
+        until: Only messages up to this moment, same formats. A bare date
+               includes that whole day.
+        from_me: True for only the user's own messages, False for only the
+                 other side's.
     """
     start = time.time()
     params: dict[str, Any] = {"chat_jid": chat_jid, "limit": min(limit, 500)}
     if before:
         params["before"] = before
+    if media_type:
+        params["media_type"] = media_type
+    if since:
+        params["since"] = _to_unix(since, end_of_day=False)
+    if until:
+        params["until"] = _to_unix(until, end_of_day=True)
+    if from_me is not None:
+        params["from_me"] = "true" if from_me else "false"
     try:
         result = await _bridge_get("/api/messages", params)
 

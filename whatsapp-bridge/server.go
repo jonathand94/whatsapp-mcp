@@ -76,6 +76,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/calls", s.handleListCalls)
 	s.mux.HandleFunc("GET /api/messages", s.handleListMessages)
 	s.mux.HandleFunc("GET /api/contacts/search", s.handleSearchContacts)
+	s.mux.HandleFunc("GET /api/chats/search", s.handleSearchChats)
 	s.mux.HandleFunc("GET /api/groups", s.handleListGroups)
 
 	s.mux.HandleFunc("POST /api/sends", s.handleCreateDraft)
@@ -489,6 +490,9 @@ type chatRow struct {
 	LastMessageTime    int64  `json:"last_message_time"`
 	LastMessagePreview string `json:"last_message_preview"`
 	UnreadCount        int    `json:"unread_count"`
+	// MergedJIDs lists every JID of this chat when it is known under more
+	// than one (a phone JID and a @lid); see chat_lookup.go.
+	MergedJIDs []string `json:"merged_jids,omitempty"`
 }
 
 type chatListResponse struct {
@@ -506,30 +510,16 @@ func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 	offset := parseIntDefault(q.Get("offset"), 0)
 	unreadOnly := q.Get("unread_only") == "true"
 
-	sqlStr := `SELECT jid, chat_type, COALESCE(name, ''), COALESCE(last_message_time, 0), COALESCE(last_message_preview, ''), unread_count
-	           FROM chats`
-	args := []any{}
+	where := ""
 	if unreadOnly {
-		sqlStr += ` WHERE unread_count > 0`
+		where = "unread_count > 0"
 	}
-	sqlStr += ` ORDER BY last_message_time DESC LIMIT ? OFFSET ?`
-	args = append(args, limit, offset)
-
-	rows, err := s.db.QueryContext(r.Context(), sqlStr, args...)
+	chats, err := s.chatsPage(r.Context(), where, nil, offset, limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "query failed", Details: err.Error()})
 		return
 	}
-	defer rows.Close()
-
-	out := chatListResponse{Chats: []chatRow{}}
-	for rows.Next() {
-		var c chatRow
-		if err := rows.Scan(&c.JID, &c.ChatType, &c.Name, &c.LastMessageTime, &c.LastMessagePreview, &c.UnreadCount); err != nil {
-			continue
-		}
-		out.Chats = append(out.Chats, c)
-	}
+	out := chatListResponse{Chats: chats}
 	out.Count = len(out.Chats)
 	out.BridgeState = s.currentBridgeState()
 	writeJSON(w, http.StatusOK, out)
@@ -546,6 +536,24 @@ type messageRow struct {
 	IsFromMe      bool    `json:"is_from_me"`
 	Transcript    *string `json:"voice_note_transcript,omitempty"`
 	QuotedID      string  `json:"quoted_message_id,omitempty"`
+	// What a media message carries, known without downloading it: a document
+	// with no caption used to be just "document", so finding "the .docx Rodrigo
+	// sent" meant downloading every attachment in the chat. Filename is only
+	// the sender's own name for it (documents); photos and voice notes have none.
+	Filename string `json:"filename,omitempty"`
+	Mime     string `json:"mime,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+}
+
+// mediaTypeFilters are the values list_messages accepts for media_type.
+var mediaTypeFilters = map[string][]string{
+	"image":    {"image"},
+	"video":    {"video"},
+	"audio":    {"audio", "voice"},
+	"voice":    {"voice"},
+	"document": {"document"},
+	"sticker":  {"sticker"},
+	"media":    {"image", "video", "audio", "voice", "document", "sticker"},
 }
 
 type messageListResponse struct {
@@ -617,11 +625,45 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			where += " AND 1 = 0"
 		}
 	}
+	// Rows of plumbing stored before the bridge stopped keeping them (see
+	// isPlumbing) are blank; they are left in the database but not shown.
+	where += " AND NOT (type = 'system' AND COALESCE(content_text, '') = '')"
+
+	// Filters, so finding an attachment does not mean paging through a chat:
+	// media_type (see mediaTypeFilters), since/until (unix seconds, inclusive)
+	// and from_me (true: only the user's messages; false: only the others').
+	if mt := q.Get("media_type"); mt != "" {
+		kinds, ok := mediaTypeFilters[mt]
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, errorResponse{
+				Error:   fmt.Sprintf("media_type %q not supported", mt),
+				Details: "use image, video, audio, voice, document, sticker or media"})
+			return
+		}
+		where += fmt.Sprintf(" AND type IN (%s)", inClausePlaceholders(len(kinds)))
+		args = append(args, jidsToArgs(kinds)...)
+	}
+	if v := q.Get("since"); v != "" {
+		where += " AND timestamp >= ?"
+		args = append(args, parseIntDefault(v, 0))
+	}
+	if v := q.Get("until"); v != "" {
+		where += " AND timestamp <= ?"
+		args = append(args, parseIntDefault(v, 0))
+	}
+	switch q.Get("from_me") {
+	case "true":
+		where += " AND is_from_me = 1"
+	case "false":
+		where += " AND is_from_me = 0"
+	}
+
 	args = append(args, limit)
 	query := fmt.Sprintf(`
 		SELECT id, chat_jid, COALESCE(sender_jid, ''), COALESCE(sender_display, ''), timestamp, type,
 		       COALESCE(scrubbed_text, COALESCE(content_text, '')),
-		       is_from_me, voice_note_transcript, COALESCE(quoted_message_id, '')
+		       is_from_me, voice_note_transcript, COALESCE(quoted_message_id, ''),
+		       COALESCE(media_filename, ''), COALESCE(media_mime, ''), COALESCE(media_file_length, 0)
 		FROM messages
 		WHERE %s
 		ORDER BY timestamp DESC, id DESC
@@ -636,14 +678,22 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	out := messageListResponse{Messages: []messageRow{}}
+	ownName := s.ownDisplayName()
 	for rows.Next() {
 		var m messageRow
 		var fromMe int
 		if err := rows.Scan(&m.ID, &m.ChatJID, &m.SenderJID, &m.SenderDisplay, &m.Timestamp, &m.Type,
-			&m.ContentText, &fromMe, &m.Transcript, &m.QuotedID); err != nil {
+			&m.ContentText, &fromMe, &m.Transcript, &m.QuotedID,
+			&m.Filename, &m.Mime, &m.Size); err != nil {
 			continue
 		}
 		m.IsFromMe = fromMe == 1
+		// The user's own messages synced from the phone often carry no push
+		// name, and were shown as a bare number ("99990069399676"). They are
+		// the user's; say so.
+		if m.IsFromMe && isBareNumber(m.SenderDisplay) {
+			m.SenderDisplay = ownName
+		}
 		out.Messages = append(out.Messages, m)
 	}
 	out.Count = len(out.Messages)
@@ -710,7 +760,7 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 		WHERE normalized_name LIKE ? OR normalized_full_name LIKE ? OR phone LIKE ? OR lid LIKE ?
 		ORDER BY updated_at DESC
 		LIMIT ?
-	`, "%"+norm+"%", "%"+norm+"%", "%"+query+"%", "%"+query+"%", limit)
+	`, "%"+norm+"%", "%"+norm+"%", "%"+query+"%", "%"+query+"%", limit*5) // device rows fold away below
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "query failed", Details: err.Error()})
 		return
@@ -732,40 +782,32 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	rows.Close()
 
-	// Expand: for each match, gather aliases and pull any contact rows we
-	// don't already have. Dedupe by JID.
+	// One entry per person: device variants and alias rows (phone JID and
+	// @lid) fold together, with the other forms listed under aliases. Callers
+	// can list_messages with any of them; the bridge merges the history.
+	// Rows for an alias that did not match the query are pulled in so their
+	// names can fill gaps. See chat_lookup.go.
+	rowsOut := make([]contactRow, 0, len(matches))
 	seen := map[string]bool{}
-	out := contactListResponse{Contacts: []contactRow{}}
-
 	for _, m := range matches {
-		if seen[m.c.JID] {
-			continue
-		}
-		aliases, _ := resolveAliases(r.Context(), s.db, m.c.JID)
-		// First slot in resolveAliases is the JID itself; the rest are aliases.
-		if len(aliases) > 1 {
-			m.c.Aliases = aliases[1:]
-		}
-		seen[m.c.JID] = true
-		out.Contacts = append(out.Contacts, m.c)
-
-		// Also surface alias rows as separate contacts so callers can list_messages
-		// against either form. They carry the original-row's aliases inverted.
-		for _, alt := range aliases[1:] {
+		rowsOut = append(rowsOut, m.c)
+		seen[nonADJID(m.c.JID)] = true
+	}
+	for _, m := range matches {
+		aliases, _ := resolveAliases(r.Context(), s.db, nonADJID(m.c.JID))
+		for _, alt := range aliases {
 			if seen[alt] {
 				continue
 			}
-			altRow, ok := loadContactRow(r.Context(), s.db, alt)
-			if !ok {
-				continue
-			}
-			altAliases, _ := resolveAliases(r.Context(), s.db, alt)
-			if len(altAliases) > 1 {
-				altRow.Aliases = altAliases[1:]
-			}
 			seen[alt] = true
-			out.Contacts = append(out.Contacts, altRow)
+			if altRow, ok := loadContactRow(r.Context(), s.db, alt); ok {
+				rowsOut = append(rowsOut, altRow)
+			}
 		}
+	}
+	out := contactListResponse{Contacts: mergeContacts(r.Context(), s.db, rowsOut)}
+	if len(out.Contacts) > limit {
+		out.Contacts = out.Contacts[:limit]
 	}
 
 	out.Count = len(out.Contacts)
@@ -804,6 +846,9 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 type errorResponse struct {
 	Error   string `json:"error"`
 	Details string `json:"details,omitempty"`
+	// RetryAfterMS, on a rate-limit refusal, is how long until the limit that
+	// refused would let the request through (also sent as Retry-After).
+	RetryAfterMS int64 `json:"retry_after_ms,omitempty"`
 }
 
 func notImplemented(w http.ResponseWriter, tool, details string) {

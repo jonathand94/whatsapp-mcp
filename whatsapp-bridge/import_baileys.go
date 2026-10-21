@@ -184,8 +184,8 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			messagesInserted++
 			msgsForChat++
 
-			if ts > lastTs {
-				lastTs = ts
+			if sortTS := chatSortTime(ts, time.Now()); sortTS > lastTs {
+				lastTs = sortTS
 				lastPreview = truncate(content, 120)
 			}
 		}

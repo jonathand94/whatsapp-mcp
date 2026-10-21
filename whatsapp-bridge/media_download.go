@@ -531,18 +531,52 @@ func strPtr(s string) *string { return &s }
 // ".jpeg"/".jpg", so downloads landed as .jfif — an extension many tools refuse
 // to treat as an image, even though the bytes are ordinary JPEG. On Linux/macOS
 // the same call returns ".jpeg", which is why this went unnoticed upstream.
+//
+// The same is true beyond Windows: Linux's mime database lists text/html as
+// ".ehtml" first, so a received HTML file was saved as "....ehtml" — an
+// extension nothing opens — and forwarded under that name. Every type people
+// commonly send is pinned here for that reason.
 var canonicalExtensions = map[string]string{
-	"image/jpeg":      ".jpg",
-	"image/png":       ".png",
-	"image/gif":       ".gif",
-	"image/webp":      ".webp",
-	"video/mp4":       ".mp4",
-	"video/3gpp":      ".3gp",
-	"audio/ogg":       ".ogg",
-	"audio/mpeg":      ".mp3",
-	"audio/mp4":       ".m4a",
-	"audio/amr":       ".amr",
-	"application/pdf": ".pdf",
+	"image/jpeg":                   ".jpg",
+	"image/png":                    ".png",
+	"image/gif":                    ".gif",
+	"image/webp":                   ".webp",
+	"image/heic":                   ".heic",
+	"video/mp4":                    ".mp4",
+	"video/3gpp":                   ".3gp",
+	"video/quicktime":              ".mov",
+	"audio/ogg":                    ".ogg",
+	"audio/mpeg":                   ".mp3",
+	"audio/mp4":                    ".m4a",
+	"audio/aac":                    ".aac",
+	"audio/amr":                    ".amr",
+	"audio/wav":                    ".wav",
+	"audio/x-wav":                  ".wav",
+	"application/pdf":              ".pdf",
+	"text/html":                    ".html",
+	"text/plain":                   ".txt",
+	"text/csv":                     ".csv",
+	"text/xml":                     ".xml",
+	"application/xml":              ".xml",
+	"application/json":             ".json",
+	"text/markdown":                ".md",
+	"application/rtf":              ".rtf",
+	"text/rtf":                     ".rtf",
+	"application/zip":              ".zip",
+	"application/x-zip-compressed": ".zip",
+	"application/vnd.rar":          ".rar",
+	"application/x-rar-compressed": ".rar",
+	"application/x-7z-compressed":  ".7z",
+	"application/msword":           ".doc",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+	"application/vnd.ms-excel": ".xls",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         ".xlsx",
+	"application/vnd.ms-powerpoint":                                             ".ppt",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+	"application/vnd.oasis.opendocument.text":                                   ".odt",
+	"application/vnd.oasis.opendocument.spreadsheet":                            ".ods",
+	"application/vnd.oasis.opendocument.presentation":                           ".odp",
+	"application/vnd.android.package-archive":                                   ".apk",
 }
 
 // extensionForMime returns a filesystem extension for a given mime type,

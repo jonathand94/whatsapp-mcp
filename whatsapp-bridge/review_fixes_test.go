@@ -12,6 +12,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
 )
 
 func seedDraft(t *testing.T, s *Server, id, status string, createdAt int64, filePath string) {
@@ -242,5 +246,98 @@ func TestRemoveOrphansClearsThePreviousRunsScratch(t *testing.T) {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("%s should be kept", p)
 		}
+	}
+}
+
+// TestOwnChatIsNeverNew pins the 2026-10-21 bug: the user's own chat has no
+// inbound messages by construction, so every send to it counted as opening a
+// conversation with a stranger, by either of its JIDs.
+func TestOwnChatIsNeverNew(t *testing.T) {
+	s, db := newMediaTestServer(t)
+	own := types.NewJID("5215550175084", types.DefaultUserServer)
+	ownDevice := own
+	ownDevice.Device = 62
+	ownLID := types.NewJID("99990069399676", types.HiddenUserServer)
+	s.bridge.client = &whatsmeow.Client{Store: &store.Device{ID: &ownDevice, LID: ownLID}}
+	if _, err := db.Exec(`INSERT INTO jid_aliases (jid_a, jid_b, discovered_at, source) VALUES (?, ?, 1, 't'), (?, ?, 1, 't')`,
+		own.String(), ownLID.String(), ownLID.String(), own.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	keys := map[string]bool{}
+	for _, jid := range []string{own.String(), ownLID.String()} {
+		key, isNew, err := s.classifyRecipient(t.Context(), jid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if isNew {
+			t.Fatalf("%s: the user's own chat was classified as a new conversation", jid)
+		}
+		keys[key] = true
+	}
+	if len(keys) != 1 {
+		t.Fatalf("the phone and @lid forms of one chat got different keys: %v", keys)
+	}
+
+	// A real stranger still counts as new.
+	if _, isNew, _ := s.classifyRecipient(t.Context(), "5215550000001@s.whatsapp.net"); !isNew {
+		t.Fatal("a chat with no inbound messages must still be new")
+	}
+}
+
+func TestChatSortTimeClampsTheFuture(t *testing.T) {
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	if got := chatSortTime(2359569747, now); got != now.Unix() {
+		t.Fatalf("a 2044 timestamp sorted the chat at %d, want now", got)
+	}
+	if skew := now.Add(time.Hour).Unix(); chatSortTime(skew, now) != skew {
+		t.Fatal("an hour of clock skew is not the future; it must be kept")
+	}
+	if chatSortTime(1784309593, now) != 1784309593 {
+		t.Fatal("a past timestamp must be kept as is")
+	}
+}
+
+// TestMigration008RepairsChatsFromTheFuture: the chat pinned at the top by an
+// image dated 2044 goes back to the time of its newest believable message,
+// and the message itself is left alone.
+func TestMigration008RepairsChatsFromTheFuture(t *testing.T) {
+	_, db := newMediaTestServer(t)
+	const pedro = "5215550227630@s.whatsapp.net"
+	seedChat(t, db, pedro, "direct", "Pedro")
+	seedChat(t, db, "5215550000001@s.whatsapp.net", "direct", "Otro")
+	if _, err := db.Exec(`
+		INSERT INTO messages (id, chat_jid, sender_jid, timestamp, type, content_text, is_from_me) VALUES
+		  ('OK1', ?, '', 1784309593, 'image', '', 1),
+		  ('BOGUS', ?, '', 2359569747, 'image', '', 1)`, pedro, pedro); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE chats SET last_message_time = 2359569747 WHERE jid = ?`, pedro); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE chats SET last_message_time = 1780000000 WHERE jid = '5215550000001@s.whatsapp.net'`); err != nil {
+		t.Fatal(err)
+	}
+
+	sqlBytes, err := migrationsFS.ReadFile("migrations/008_future_chat_times.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(sqlBytes)); err != nil {
+		t.Fatal(err)
+	}
+
+	var got, other, msgTS int64
+	db.QueryRow(`SELECT last_message_time FROM chats WHERE jid = ?`, pedro).Scan(&got)
+	db.QueryRow(`SELECT last_message_time FROM chats WHERE jid = '5215550000001@s.whatsapp.net'`).Scan(&other)
+	db.QueryRow(`SELECT timestamp FROM messages WHERE id = 'BOGUS'`).Scan(&msgTS)
+	if got != 1784309593 {
+		t.Fatalf("repaired chat time = %d, want the newest believable message (1784309593)", got)
+	}
+	if other != 1780000000 {
+		t.Fatalf("a healthy chat was changed: %d", other)
+	}
+	if msgTS != 2359569747 {
+		t.Fatal("the message's own timestamp must be left as it came")
 	}
 }

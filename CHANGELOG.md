@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **The new-conversation limit counted messages, not conversations, and counted the user's own chat.** Five files sent to oneself used up the day's five "new conversations" and blocked every further send (found by the 2026-10-21 test run). The own chat has no inbound messages by construction, so it always looked like a stranger. Now a chat counts once per 24 h, the own chat (phone and @lid forms) never counts, and the refusal says when the next slot frees up (`new_chats_next_slot_at` in the send budget).
+- **Parallel confirms to one chat were refused for arriving 2 s apart.** The 5 s spacing between sends to the same chat now queues a send for its turn (up to 15 s ahead) instead of refusing it, and is enforced at the moment of sending — so two uploads finishing together still go out 5 s apart. A deeper queue is still refused as a burst, with `retry_after_ms`.
+- **A chat dated 2044 was pinned to the top of the chat list.** One imported message carried a timestamp from the future and the import keeps `MAX()`. Chat sort times more than a day ahead are clamped on every write path, and migration 008 repairs the rows already written. The message keeps its own timestamp.
+- **Blank "system" messages kept piling up** (24,111 and growing): every Signal group-key distribution was stored as an empty row and blanked its chat's preview. Content-free messages are no longer stored; the old rows are hidden from `list_messages`.
+- **One person appeared several times** in `list_chats` (phone JID and @lid) and in contact search (plus one row per linked device, `:79`, `:80`…). Both now return one entry per person, with the other forms under `merged_jids` / `aliases`. The user's own messages show the user's name instead of a bare number.
+- Received HTML files were saved as `.ehtml` (Linux's mime database lists it first); common types now have pinned extensions.
+
 - **Media downloaded on another machine was fetched from WhatsApp again, and old files failed.** After moving the bridge from Windows to Linux, `media_path` still pointed at `C:\Users\...`, so the fast path missed and the bridge asked WhatsApp for the bytes — which answers 404/410 for older media. Three of the download failures in the deployment's audit log were files already on disk. `DownloadMediaFile` now looks for the message's file in the media folder by stem (the extension depends on the OS that downloaded it: `.jfif`, `.dtsconfig`) and repoints the row.
 - **Expired media is recovered from the phone.** A 403/404/410 from the CDN now triggers a media retry receipt (`SendMediaRetryReceipt`), and the download continues with the fresh direct path the phone sends back. When the phone is offline or no longer has the file, the error says so (HTTP 410) instead of a bare status code.
 - **A large media send could report failure after it had been delivered.** Confirm ran the upload inside the HTTP request, and the server's 60 s `WriteTimeout` fired first — the message went out with nobody left to tell, the caller saw an error, and the obvious next step was sending it again. Uploads now run as jobs detached from the request (see Added).
@@ -31,6 +38,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `GET /api/sends/{draft_id}`: a draft's state (`preparing`, `draft`, `uploading`, `sent`, `failed`, `expired`, `rejected`), with progress while a job runs and the reason when a confirm's upload failed.
 - `messages.media_filename` (migration 007): the name a document was sent with, captured on receive, on history sync and on send. `POST /api/media/download` now also returns `filename` (original, or generated like `Imagen 2026-10-21 12.34.56.jpg`), chat, sender and timestamp.
 - Abandoned drafts are swept (`outbound_sweep.go`): at startup the previous run's partial and scratch files are deleted before the API serves, and every hour drafts past their hour are marked expired and their files freed. With drafts of up to 2 GB, a few abandoned ones would otherwise fill the disk the message database lives on.
+- `GET /api/chats/search`: find chats, groups included, by name — accent-insensitive, with a `chat_type` filter. Groups could not be found by name before.
+- `GET /api/messages` returns each media message's `filename`, `mime` and `size`, and accepts `media_type`, `since`, `until` and `from_me` filters.
 
 ## [0.4.0] - 2026-08-19
 

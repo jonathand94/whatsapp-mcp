@@ -32,6 +32,7 @@ import (
 	"context"
 	"log"
 	"strings"
+	"time"
 
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -168,7 +169,7 @@ func (b *Bridge) onUndecryptableMessage(evt *events.UndecryptableMessage) {
 			last_message_preview = excluded.last_message_preview,
 			updated_at = excluded.updated_at
 	`, chatJID, chatTypeFromJID(evt.Info.Chat), chatName, Normalize(chatName),
-		ts, ts, id, ts, marker)
+		ts, ts, id, chatSortTime(ts, time.Now()), marker)
 	if err != nil {
 		log.Printf("onUndecryptableMessage: chat upsert failed: %v", err)
 	}

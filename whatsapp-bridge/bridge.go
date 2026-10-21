@@ -372,6 +372,15 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	ts := evt.Info.Timestamp.Unix()
 
 	content, msgType := extractContent(evt)
+	if isPlumbing(msgType, content) {
+		// Nothing to store, and nothing for the chat list (see isPlumbing).
+		// What such a message does teach — which phone number a @lid is —
+		// is still recorded.
+		if !evt.Info.IsGroup {
+			b.recordMessageAliases(evt, ts)
+		}
+		return
+	}
 	normalized := Normalize(content)
 	scrubbed, flags := Scrub(content)
 
@@ -419,7 +428,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 			last_message_preview = excluded.last_message_preview,
 			updated_at = excluded.updated_at
 	`, chatJID, chatTypeFromJID(evt.Info.Chat), chatName, chatNameNorm,
-		ts, ts, id, ts, truncate(content, 120))
+		ts, ts, id, chatSortTime(ts, time.Now()), truncate(content, 120))
 	if err != nil {
 		log.Printf("onMessage: chat upsert failed: %v", err)
 	}
@@ -518,17 +527,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 			log.Printf("onMessage: contact upsert failed: %v", err)
 		}
 
-		// Record JID alias edges. WhatsApp now exposes most contacts as a
-		// (LID, phone-JID) pair; whatsmeow surfaces the alt form via
-		// SenderAlt for incoming DMs and RecipientAlt for outgoing. Without
-		// this, the two forms accumulate as orphaned rows and search/list
-		// returns whichever the bridge happened to see first. See aliases.go.
-		ctx := context.Background()
-		if evt.Info.IsFromMe {
-			recordJIDAlias(ctx, b.db, evt.Info.Chat, evt.Info.RecipientAlt, "message_recipient", ts)
-		} else {
-			recordJIDAlias(ctx, b.db, evt.Info.Sender, evt.Info.SenderAlt, "message_sender", ts)
-		}
+		b.recordMessageAliases(evt, ts)
 	}
 
 	// Enqueue voice-note transcription. Fire-and-forget; the transcriber
@@ -546,6 +545,21 @@ func (b *Bridge) onMessage(evt *events.Message) {
 				},
 			})
 		}
+	}
+}
+
+// recordMessageAliases records the JID alias edge a direct message reveals.
+// WhatsApp now exposes most contacts as a (LID, phone-JID) pair; whatsmeow
+// surfaces the alt form via SenderAlt for incoming DMs and RecipientAlt for
+// outgoing. Without this, the two forms accumulate as orphaned rows and
+// search/list returns whichever the bridge happened to see first. See
+// aliases.go.
+func (b *Bridge) recordMessageAliases(evt *events.Message, ts int64) {
+	ctx := context.Background()
+	if evt.Info.IsFromMe {
+		recordJIDAlias(ctx, b.db, evt.Info.Chat, evt.Info.RecipientAlt, "message_recipient", ts)
+	} else {
+		recordJIDAlias(ctx, b.db, evt.Info.Sender, evt.Info.SenderAlt, "message_sender", ts)
 	}
 }
 
@@ -723,6 +737,16 @@ var carrierFields = map[string]bool{
 	"messageContextInfo": true,
 	// Signal-protocol group sender-key distribution. No user payload, ever.
 	"senderKeyDistributionMessage": true,
+}
+
+// isPlumbing reports whether a decoded message has nothing for a person in it:
+// only carrier fields (Signal group-key distribution, context metadata), which
+// is how extractContent comes to return an empty "system". WhatsApp shows
+// nothing for these. Stored, they were blank rows in the chat — over 24,000 by
+// October 2026, a few more with every group key rotation — and each one
+// replaced its chat's preview and time with nothing. They are not stored.
+func isPlumbing(msgType, content string) bool {
+	return msgType == "system" && content == ""
 }
 
 // unsupportedMessageType names the populated content field(s) of a message

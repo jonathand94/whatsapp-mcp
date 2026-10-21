@@ -449,7 +449,7 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	// chat in WhatsApp before resending", sending someone to look for a message
 	// that was never sent. Refusing here leaves the draft in 'draft', reusable
 	// once the window clears.
-	isNewChat, classifyErr := s.chatHasNoInbound(r.Context(), recipientJID)
+	chatKey, isNewChat, classifyErr := s.classifyRecipient(r.Context(), recipientJID)
 	if classifyErr != nil {
 		// Fail closed. The draft was read from this same database moments ago,
 		// so a failure here is genuinely exceptional — and guessing "not new"
@@ -461,17 +461,21 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if d := s.sendGov().Authorize(recipientJID, isNewChat, time.Now()); !d.Allow {
+	d := s.sendGov().Authorize(chatKey, isNewChat, time.Now())
+	if !d.Allow {
 		log.Printf("send throttled draft=%s recipient=%s new_chat=%t: %s", draftID, recipientJID, isNewChat, d.Reason)
 		if d.RetryAfter > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(int(d.RetryAfter.Seconds())+1))
 		}
 		writeJSON(w, http.StatusTooManyRequests, errorResponse{
-			Error:   "send rate limit",
-			Details: d.Reason + ". The draft was not consumed and can be confirmed again later.",
+			Error:        "send rate limit",
+			Details:      d.Reason + ". The draft was not consumed and can be confirmed again later.",
+			RetryAfterMS: d.RetryAfter.Milliseconds(),
 		})
 		return
 	}
+	// The turn this send was given in its chat; commitSend waits for it.
+	turn := sendTurn{chat: chatKey, at: d.SendAt}
 
 	// Build the outbound message based on send type.
 	var msg *waE2E.Message
@@ -579,7 +583,7 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			j.setPhase("enviando el mensaje")
-			return s.commitSend(ctx, draftID, recipient, recipientJID, recipientDisplay, mediaPath, built)
+			return s.commitSend(ctx, draftID, recipient, recipientJID, recipientDisplay, mediaPath, built, turn)
 		})
 		answerJob(w, r, up, jobPending{
 			DraftID:          draftID,
@@ -597,8 +601,15 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code, body := s.commitSend(r.Context(), draftID, recipient, recipientJID, recipientDisplay, "", msg)
+	code, body := s.commitSend(r.Context(), draftID, recipient, recipientJID, recipientDisplay, "", msg, turn)
 	writeJSON(w, code, body)
+}
+
+// sendTurn is a send's place in its chat's queue: the governor's key for the
+// chat, and the moment Authorize scheduled it for.
+type sendTurn struct {
+	chat string
+	at   time.Time
 }
 
 // uploadingHint tells a caller holding a 202 from confirm what to do next.
@@ -691,7 +702,24 @@ func (s *Server) awaitConnection(ctx context.Context, grace time.Duration) bool 
 // Every send type ends here: text inline from the handler, media from the job
 // that uploaded its file. ctx bounds the flip and the send; the bookkeeping
 // after a successful send is deliberately detached from it (see persistCtx).
-func (s *Server) commitSend(ctx context.Context, draftID string, recipient types.JID, recipientJID, recipientDisplay, mediaPath string, msg *waE2E.Message) (int, any) {
+func (s *Server) commitSend(ctx context.Context, draftID string, recipient types.JID, recipientJID, recipientDisplay, mediaPath string, msg *waE2E.Message, turn sendTurn) (int, any) {
+	// Wait for this send's turn in its chat, while the draft is still a
+	// draft: giving up here (the caller hung up) leaves nothing half-done.
+	// Authorize scheduled the turn; ClaimSend also keeps the gap from a send
+	// that went out later than its turn, as a long upload's does.
+	if wait := time.Until(turn.at); wait > 0 {
+		select {
+		case <-ctx.Done():
+			return http.StatusServiceUnavailable, errorResponse{
+				Error: "send cancelled", Details: "the request ended while waiting its turn; nothing was sent and the draft can be confirmed again"}
+		case <-time.After(wait):
+		}
+	}
+	if err := s.sendGov().ClaimSend(ctx, turn.chat); err != nil {
+		return http.StatusServiceUnavailable, errorResponse{
+			Error: "send cancelled", Details: "the request ended while waiting its turn; nothing was sent and the draft can be confirmed again"}
+	}
+
 	// Flip to confirmed BEFORE sending, so double-confirm races are blocked.
 	now := time.Now().Unix()
 	res, err := s.db.ExecContext(ctx,

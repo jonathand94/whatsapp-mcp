@@ -167,39 +167,45 @@ func TestHistorySyncAndLiveReceiveDecodeIdentically(t *testing.T) {
 	}
 }
 
-// A message with no readable content must ALSO agree across writers: live
-// stores an empty system row, and the backfill must leave that row alone rather
-// than rewriting it with the same emptiness.
+// A message with no readable content must ALSO agree across writers. Since
+// 2026-10-21 neither writer stores one (isPlumbing); a row an earlier version
+// stored must be left alone by the backfill rather than rewritten.
 func TestHistorySyncAndLiveAgreeOnAContentFreeMessage(t *testing.T) {
 	db := undecodedTestDB(t)
 	b := &Bridge{db: db}
 	const ts = 1784846700
 
+	// Live: a message carrying only group-key distribution is plumbing, and
+	// is not stored at all (isPlumbing) — no blank row, no blank preview.
 	b.handleEvent(&events.Message{
 		Info: parityTestInfo(t, "live-empty", ts),
 		Message: &waE2E.Message{
 			SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{},
 		},
 	})
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE id = 'live-empty'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a content-free live message was stored (%d rows, %v)", n, err)
+	}
+
+	// An empty row an earlier version stored stays exactly as it was: the
+	// backfill must not turn plumbing into content either.
 	insertTestMessage(t, db, "hist-empty", "12147735814-1589465137@g.us", "system", "", ts)
-	n, err := b.backfillDecodedContent("hist-empty", &waE2E.Message{
+	updated, err := b.backfillDecodedContent("hist-empty", &waE2E.Message{
 		SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{},
 	})
 	if err != nil {
 		t.Fatalf("backfillDecodedContent: %v", err)
 	}
-	if n != 0 {
-		t.Fatalf("a content-free message must not rewrite the row; %d row(s) updated", n)
+	if updated != 0 {
+		t.Fatalf("a content-free message must not rewrite the row; %d row(s) updated", updated)
 	}
-
-	liveType, liveText := parityRow(t, db, "live-empty")
 	histType, histText := parityRow(t, db, "hist-empty")
-	if liveType != histType || liveText != histText {
-		t.Fatalf("content-free message disagrees across writers:\n  live:    type=%q text=%q\n  history: type=%q text=%q",
-			liveType, liveText, histType, histText)
+	if histType != "system" || histText != "" {
+		t.Fatalf("the old row changed: (%q, %q)", histType, histText)
 	}
-	if liveType != "system" || liveText != "" {
-		t.Fatalf("a protocol-only message must stay a silent empty system row, got (%q, %q)", liveType, liveText)
+	if !isPlumbing("system", "") || isPlumbing("system", "[unsupported: pinInChatMessage]") || isPlumbing("text", "") {
+		t.Fatal("isPlumbing must be exactly: system with no content")
 	}
 }
 

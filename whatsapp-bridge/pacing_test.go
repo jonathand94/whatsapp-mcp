@@ -1,40 +1,55 @@
 package main
 
 import (
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// TestSpacingStopsARunawayLoop covers the failure this was written for: a retry
-// loop, or a caller that misreads an instruction, hammering one chat. That is
-// both the most visible automation tell to WhatsApp and the fastest way to make
-// a real person block and report the number.
-func TestSpacingStopsARunawayLoop(t *testing.T) {
-	g := newSendGovernor(defaultSendLimits())
+// TestSpacingQueuesThenStopsARunawayLoop covers the failure this was written
+// for: a retry loop, or a caller that misreads an instruction, hammering one
+// chat. That is both the most visible automation tell to WhatsApp and the
+// fastest way to make a real person block and report the number.
+//
+// A few sends to one chat at once are queued, MinGapSameChat apart — that is
+// an assistant sending five files to one person. Past MaxWaitSameChat it is a
+// burst, and it is refused.
+func TestSpacingQueuesThenStopsARunawayLoop(t *testing.T) {
+	lim := defaultSendLimits()
+	g := newSendGovernor(lim)
 	now := time.Now()
 	const chat = "5215550647337@s.whatsapp.net"
 
-	if d := g.Authorize(chat, false, now); !d.Allow {
-		t.Fatalf("first send refused: %s", d.Reason)
+	queued := int(lim.MaxWaitSameChat/lim.MinGapSameChat) + 1 // 0 s, 5 s, 10 s, 15 s
+	for i := 0; i < queued; i++ {
+		d := g.Authorize(chat, false, now)
+		if !d.Allow {
+			t.Fatalf("send %d refused although it fits the queue: %s", i, d.Reason)
+		}
+		if want := now.Add(time.Duration(i) * lim.MinGapSameChat); !d.SendAt.Equal(want) {
+			t.Fatalf("send %d scheduled at +%s, want +%s", i, d.SendAt.Sub(now), want.Sub(now))
+		}
 	}
 
-	// A loop retrying immediately gets nothing through, no matter how many
-	// times it tries.
+	// A loop retrying immediately gets nothing more through, no matter how
+	// many times it tries.
 	for i := 0; i < 50; i++ {
 		d := g.Authorize(chat, false, now.Add(time.Duration(i)*10*time.Millisecond))
 		if d.Allow {
-			t.Fatalf("attempt %d slipped through inside the minimum gap", i)
+			t.Fatalf("attempt %d slipped through a full queue", i)
 		}
-		if d.RetryAfter <= 0 {
-			t.Fatal("a spacing refusal must say how long to wait")
+		if d.RetryAfter <= 0 || d.Limit != refusedSpacing {
+			t.Fatalf("a spacing refusal must say how long to wait: %+v", d)
 		}
 	}
 
-	// And once the gap has genuinely passed, the same chat works again: this
+	// And once the queue has drained, the same chat works again at once: this
 	// throttles, it does not blacklist.
-	if d := g.Authorize(chat, false, now.Add(6*time.Second)); !d.Allow {
-		t.Fatalf("refused after the gap elapsed: %s", d.Reason)
+	later := now.Add(time.Duration(queued) * lim.MinGapSameChat)
+	if d := g.Authorize(chat, false, later); !d.Allow || !d.SendAt.Equal(later) {
+		t.Fatalf("refused or delayed after the queue drained: %+v", d)
 	}
 }
 
@@ -73,18 +88,99 @@ func TestNewChatLimitIsTheOneThatMatters(t *testing.T) {
 // the entire daily allowance without delivering a single message, and the
 // account would go quiet for a day for no reason.
 func TestRefusalCostsNothing(t *testing.T) {
-	g := newSendGovernor(defaultSendLimits())
+	lim := defaultSendLimits()
+	g := newSendGovernor(lim)
 	now := time.Now()
 	const chat = "5215550647337@s.whatsapp.net"
 
-	g.Authorize(chat, false, now) // one real send
-	for i := 0; i < 100; i++ {
-		g.Authorize(chat, false, now) // all refused: inside the gap
+	queued := int(lim.MaxWaitSameChat/lim.MinGapSameChat) + 1
+	for i := 0; i < queued+100; i++ {
+		g.Authorize(chat, false, now) // the first few queue, the rest are refused
 	}
 
 	snap := g.Snapshot(now)
-	if got := snap["sent_last_day"].(int); got != 1 {
-		t.Fatalf("100 refused attempts consumed budget: sent_last_day = %d, want 1", got)
+	if got := snap["sent_last_day"].(int); got != queued {
+		t.Fatalf("refused attempts consumed budget: sent_last_day = %d, want %d", got, queued)
+	}
+}
+
+// TestNewChatCountsOncePerChat pins the 2026-10-21 bug: five files sent to one
+// new contact counted as five new conversations and used up the day.
+func TestNewChatCountsOncePerChat(t *testing.T) {
+	lim := defaultSendLimits()
+	g := newSendGovernor(lim)
+	base := time.Now()
+	const stranger = "5215550000001@s.whatsapp.net"
+
+	for i := 0; i < 10; i++ {
+		at := base.Add(time.Duration(i) * time.Minute)
+		if d := g.Authorize(stranger, true, at); !d.Allow {
+			t.Fatalf("message %d to the same new chat refused: %s", i, d.Reason)
+		}
+	}
+	if got := g.Snapshot(base.Add(10 * time.Minute))["new_chats_today"].(int); got != 1 {
+		t.Fatalf("one new chat counted as %d", got)
+	}
+}
+
+// TestNewChatRefusalSaysWhenItFrees: the window rolls, so "today" is not a
+// calendar day, and a caller told only "limit reached" cannot know when to
+// come back.
+func TestNewChatRefusalSaysWhenItFrees(t *testing.T) {
+	lim := defaultSendLimits()
+	g := newSendGovernor(lim)
+	base := time.Date(2026, 10, 21, 9, 0, 0, 0, time.Local)
+	for i := 0; i < lim.MaxNewChatsPerDay; i++ {
+		g.Authorize(newJID(i), true, base.Add(time.Duration(i)*time.Hour))
+	}
+	now := base.Add(10 * time.Hour)
+	d := g.Authorize(newJID(99), true, now)
+	if d.Allow || d.Limit != refusedNewChat {
+		t.Fatalf("want a new-chat refusal, got %+v", d)
+	}
+	frees := base.Add(24 * time.Hour)
+	if d.RetryAfter != frees.Sub(now) || !strings.Contains(d.Reason, frees.Format("2006-01-02 15:04")) {
+		t.Fatalf("refusal should name %s: %q (retry after %s)", frees, d.Reason, d.RetryAfter)
+	}
+	if got := g.Snapshot(now)["new_chats_next_slot_at"]; got != frees.Format(time.RFC3339) {
+		t.Fatalf("snapshot next slot = %v, want %s", got, frees.Format(time.RFC3339))
+	}
+}
+
+// TestClaimSendKeepsTheGapForLateSends: a media send goes out when its upload
+// finishes, possibly at the same moment as another upload to the same chat.
+func TestClaimSendKeepsTheGapForLateSends(t *testing.T) {
+	lim := defaultSendLimits()
+	lim.MinGapSameChat = 200 * time.Millisecond
+	g := newSendGovernor(lim)
+	const chat = "5215550647337@s.whatsapp.net"
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var sent []time.Time
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := g.ClaimSend(t.Context(), chat); err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			sent = append(sent, time.Now())
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	sort.Slice(sent, func(i, j int) bool { return sent[i].Before(sent[j]) })
+	for i := 1; i < len(sent); i++ {
+		if gap := sent[i].Sub(sent[i-1]); gap < lim.MinGapSameChat-10*time.Millisecond {
+			t.Fatalf("sends %d and %d went out %s apart, gap is %s", i-1, i, gap, lim.MinGapSameChat)
+		}
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("ClaimSend waited far longer than the gaps require")
 	}
 }
 
@@ -143,7 +239,7 @@ func TestConcurrentSendsCannotOverspend(t *testing.T) {
 }
 
 // TestStateStaysBounded matters because this runs for months at a time. Without
-// trimming, lastByChat gains an entry per chat ever written to and the send
+// trimming, the per-chat maps gain an entry per chat ever written to and the send
 // slices grow forever — a slow leak in the one process that must not be
 // restarted casually.
 func TestStateStaysBounded(t *testing.T) {
@@ -162,8 +258,8 @@ func TestStateStaysBounded(t *testing.T) {
 	if n := len(g.sent); n > 24*60 {
 		t.Fatalf("send history holds %d entries after a year; the 24h window is not trimming", n)
 	}
-	if n := len(g.lastByChat); n > 2 {
-		t.Fatalf("per-chat map holds %d entries; entries past the spacing window are not being dropped", n)
+	if n := len(g.nextTurn) + len(g.lastSent); n > 2 {
+		t.Fatalf("per-chat maps hold %d entries; entries past the spacing window are not being dropped", n)
 	}
 
 	// The assertion that actually matters, and the one a bounded-memory check
