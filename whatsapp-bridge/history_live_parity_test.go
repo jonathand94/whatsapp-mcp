@@ -83,7 +83,7 @@ func parityShapes() []parityShape {
 				},
 			},
 			wantType: "text",
-			wantText: "Que dia nos reunimos?\n- jueves\n- viernes",
+			wantText: "📊 Encuesta: Que dia nos reunimos?\n- jueves\n- viernes",
 		},
 		{
 			name: "image with caption",
@@ -234,7 +234,7 @@ func TestSingleSharedDecoderIsTheOneWithEnvelopeUnwrapping(t *testing.T) {
 	text, msgType = extractContentFromProto(&waE2E.Message{
 		PollCreationMessageV3: &waE2E.PollCreationMessage{Name: proto.String("q?")},
 	})
-	if text != "q?" || msgType != "text" {
+	if text != "📊 Encuesta: q?" || msgType != "text" {
 		t.Fatalf("the shared decoder lost its second-tier decoders: got (%q, %q)", text, msgType)
 	}
 }
