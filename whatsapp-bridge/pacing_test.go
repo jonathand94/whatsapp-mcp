@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -163,7 +164,7 @@ func TestClaimSendKeepsTheGapForLateSends(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := g.ClaimSend(t.Context(), chat); err != nil {
+			if err := g.ClaimSend(t.Context(), chat, -1); err != nil {
 				t.Error(err)
 				return
 			}
@@ -181,6 +182,87 @@ func TestClaimSendKeepsTheGapForLateSends(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("ClaimSend waited far longer than the gaps require")
+	}
+}
+
+// TestSendsGoOutInTheOrderTheyAsk: moments are booked under the lock, so the
+// order is the order of asking, and a send that would wait too long books
+// nothing — it does not push the sends behind it further out.
+func TestSendsGoOutInTheOrderTheyAsk(t *testing.T) {
+	lim := defaultSendLimits()
+	g := newSendGovernor(lim)
+	const chat = "5215550647337@s.whatsapp.net"
+	now := time.Now()
+
+	for i := 0; i < 3; i++ {
+		at, err := g.book(chat, now, -1)
+		if want := now.Add(time.Duration(i) * lim.MinGapSameChat); err != nil || !at.Equal(want) {
+			t.Fatalf("booking %d: at +%s (%v), want +%s", i, at.Sub(now), err, want.Sub(now))
+		}
+	}
+	// The next moment is 15 s out: a send allowed to wait 10 s is refused,
+	// told it is 5 s short, and books nothing.
+	_, err := g.book(chat, now, 10*time.Second)
+	var full *sendQueueFull
+	if !errors.As(err, &full) || full.RetryAfter() != 5*time.Second {
+		t.Fatalf("want a refusal 5 s short, got %v", err)
+	}
+	if at, _ := g.book(chat, now, -1); !at.Equal(now.Add(3 * lim.MinGapSameChat)) {
+		t.Fatalf("the refused send still took a moment: next booking at +%s", at.Sub(now))
+	}
+}
+
+// TestATextIsNotHeldBehindUploadsStillRunning is the 2026-10-21 review case:
+// files confirmed first hold the first turns in the chat's line, but send
+// nothing until their uploads finish. A text confirmed after them goes out at
+// once instead of sitting out turns nobody is using, and the files still go
+// out spaced when their uploads finish together.
+func TestATextIsNotHeldBehindUploadsStillRunning(t *testing.T) {
+	lim := defaultSendLimits()
+	g := newSendGovernor(lim)
+	const chat = "5215550647337@s.whatsapp.net"
+	now := time.Now()
+
+	for i := 0; i < 4; i++ { // three files, then the text
+		if d := g.Authorize(chat, false, now); !d.Allow {
+			t.Fatalf("confirm %d refused: %s", i, d.Reason)
+		}
+	}
+	if at, err := g.book(chat, now, lim.MaxWaitSameChat); err != nil || !at.Equal(now) {
+		t.Fatalf("text booked at +%s (%v), want now", at.Sub(now), err)
+	}
+	for i := 1; i <= 3; i++ {
+		at, err := g.book(chat, now.Add(time.Second), -1)
+		if want := now.Add(time.Duration(i) * lim.MinGapSameChat); err != nil || !at.Equal(want) {
+			t.Fatalf("file %d at +%s (%v), want +%s", i, at.Sub(now), err, want.Sub(now))
+		}
+	}
+}
+
+// TestVolumeRefusalsSayWhenTheyFree: the hourly and daily caps answer with
+// the moment the oldest send leaves the window, not a flat hour or day.
+func TestVolumeRefusalsSayWhenTheyFree(t *testing.T) {
+	lim := defaultSendLimits()
+	base := time.Now()
+
+	g := newSendGovernor(lim)
+	for i := 0; i < lim.MaxPerHour; i++ {
+		g.Authorize(newJID(i), false, base.Add(time.Duration(i)*time.Minute))
+	}
+	d := g.Authorize(newJID(999), false, base.Add(50*time.Minute))
+	if d.Allow || d.Limit != refusedHourly || d.RetryAfter != 10*time.Minute {
+		t.Fatalf("want the hourly cap freeing in 10m, got %+v", d)
+	}
+
+	g = newSendGovernor(lim)
+	for i := 0; i < lim.MaxPerDay; i++ {
+		if d := g.Authorize(newJID(i), false, base.Add(time.Duration(i)*2*time.Minute)); !d.Allow {
+			t.Fatalf("send %d refused under the daily cap: %s", i, d.Reason)
+		}
+	}
+	d = g.Authorize(newJID(999), false, base.Add(7*time.Hour))
+	if d.Allow || d.Limit != refusedDaily || d.RetryAfter != 17*time.Hour {
+		t.Fatalf("want the daily cap freeing in 17h, got %+v", d)
 	}
 }
 
@@ -258,7 +340,7 @@ func TestStateStaysBounded(t *testing.T) {
 	if n := len(g.sent); n > 24*60 {
 		t.Fatalf("send history holds %d entries after a year; the 24h window is not trimming", n)
 	}
-	if n := len(g.nextTurn) + len(g.lastSent); n > 2 {
+	if n := len(g.nextTurn) + len(g.nextSlot); n > 2 {
 		t.Fatalf("per-chat maps hold %d entries; entries past the spacing window are not being dropped", n)
 	}
 

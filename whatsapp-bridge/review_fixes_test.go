@@ -78,6 +78,63 @@ func TestConfirmIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestConfirmThatLostTheRaceAnswersWithTheDelivery: two confirms of one
+// draft, the second waiting for its moment while the first sends. The second
+// finds the draft already sent and must say so, not report a conflict that
+// reads as "not sent".
+func TestConfirmThatLostTheRaceAnswersWithTheDelivery(t *testing.T) {
+	s, _ := newMediaTestServer(t)
+	seedDraft(t, s, "raced-1", "sent", time.Now().Unix(), "")
+
+	code, body := s.commitSend(t.Context(), "raced-1", types.JID{}, "5215555555555@s.whatsapp.net", "Juan", "", nil, "chat-a", -1)
+	got, ok := body.(confirmResponse)
+	if code != http.StatusOK || !ok || got.WhatsAppMessageID != "3EB0SENT" {
+		t.Fatalf("got %d %+v, want the first confirm's delivery", code, body)
+	}
+}
+
+// TestTextHeldBackByALongLineSaysWhenToRetry: a text waits for its moment
+// only as long as the line may be (MaxWaitSameChat); past that it is refused
+// with the wait in the details — the only part the MCP layer passes on — and
+// the draft stays usable.
+func TestTextHeldBackByALongLineSaysWhenToRetry(t *testing.T) {
+	s, _ := newMediaTestServer(t)
+	seedDraft(t, s, "text-1", "draft", time.Now().Unix(), "")
+	g := s.sendGov()
+	for i := 0; i < 4; i++ { // four sends already going out: next moment +20 s
+		g.book("chat-b", time.Now(), -1)
+	}
+
+	code, body := s.commitSend(t.Context(), "text-1", types.JID{}, "5215555555555@s.whatsapp.net", "Juan", "", nil,
+		"chat-b", g.limits.MaxWaitSameChat)
+	e, ok := body.(errorResponse)
+	if code != http.StatusTooManyRequests || !ok || !strings.HasSuffix(e.Details, "confirm it again in 5s.") {
+		t.Fatalf("got %d %+v", code, body)
+	}
+	var status string
+	s.db.QueryRow(`SELECT status FROM sends WHERE draft_id = 'text-1'`).Scan(&status)
+	if status != "draft" {
+		t.Fatalf("draft is %q after being held back, want it still a draft", status)
+	}
+}
+
+func TestRateLimitedSaysWhenToConfirmAgain(t *testing.T) {
+	for _, c := range []struct {
+		retry, left time.Duration
+		want        string
+	}{
+		{9 * time.Second, 50 * time.Minute, "; confirm it again in 9s."},
+		{0, 50 * time.Minute, " and can be confirmed again later."},
+		{17 * time.Hour, 50 * time.Minute, ", but it expires before then: create a new one in 17h0m."},
+		{3*time.Hour + 12*time.Minute + 20*time.Second, 0, "; confirm it again in 3h12m."},
+	} {
+		got := rateLimited("limit", c.retry, c.left)
+		if got.Details != "limit. The draft was not consumed"+c.want || got.RetryAfterMS != c.retry.Milliseconds() {
+			t.Errorf("retry %s, draft left %s: %+v", c.retry, c.left, got)
+		}
+	}
+}
+
 func TestConfirmReturnsTheFinishedUploadsAnswer(t *testing.T) {
 	s, _ := newMediaTestServer(t)
 	j, _ := s.jobs().start("send:up-done", func(j *mediaJob) (int, any) {

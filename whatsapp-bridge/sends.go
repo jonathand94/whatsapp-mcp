@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -464,18 +465,10 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	d := s.sendGov().Authorize(chatKey, isNewChat, time.Now())
 	if !d.Allow {
 		log.Printf("send throttled draft=%s recipient=%s new_chat=%t: %s", draftID, recipientJID, isNewChat, d.Reason)
-		if d.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(int(d.RetryAfter.Seconds())+1))
-		}
-		writeJSON(w, http.StatusTooManyRequests, errorResponse{
-			Error:        "send rate limit",
-			Details:      d.Reason + ". The draft was not consumed and can be confirmed again later.",
-			RetryAfterMS: d.RetryAfter.Milliseconds(),
-		})
+		draftLeft := time.Until(time.Unix(createdAt+draftTTLSeconds, 0))
+		writeSendAnswer(w, http.StatusTooManyRequests, rateLimited(d.Reason, d.RetryAfter, draftLeft))
 		return
 	}
-	// The turn this send was given in its chat; commitSend waits for it.
-	turn := sendTurn{chat: chatKey, at: d.SendAt}
 
 	// Build the outbound message based on send type.
 	var msg *waE2E.Message
@@ -583,7 +576,10 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			j.setPhase("enviando el mensaje")
-			return s.commitSend(ctx, draftID, recipient, recipientJID, recipientDisplay, mediaPath, built, turn)
+			// The upload is done and paid for, so the send waits for its
+			// moment however long the chat's line is; the job has no caller
+			// holding a connection open.
+			return s.commitSend(ctx, draftID, recipient, recipientJID, recipientDisplay, mediaPath, built, chatKey, -1)
 		})
 		answerJob(w, r, up, jobPending{
 			DraftID:          draftID,
@@ -601,15 +597,52 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code, body := s.commitSend(r.Context(), draftID, recipient, recipientJID, recipientDisplay, "", msg, turn)
+	// A text is ready the moment it is confirmed, and its caller is waiting
+	// on this request, so it waits for its moment only as long as the
+	// governor lets anything line up.
+	code, body := s.commitSend(r.Context(), draftID, recipient, recipientJID, recipientDisplay, "", msg,
+		chatKey, s.sendGov().limits.MaxWaitSameChat)
+	writeSendAnswer(w, code, body)
+}
+
+// rateLimited is the answer to a send the governor holds back. The wait goes
+// in the details as well as in Retry-After and retry_after_ms, because the MCP
+// layer passes on only error and details: a wait anywhere else never reached
+// the assistant that had to sit it out (2026-10-21 test run). draftLeft is
+// how long the draft has before it expires (0 when unknown), since telling
+// someone to confirm again tomorrow a draft that dies in an hour is a trap.
+func rateLimited(reason string, retryAfter, draftLeft time.Duration) errorResponse {
+	details := reason + ". The draft was not consumed"
+	switch {
+	case retryAfter <= 0:
+		details += " and can be confirmed again later."
+	case draftLeft > 0 && retryAfter >= draftLeft:
+		details += fmt.Sprintf(", but it expires before then: create a new one in %s.", humanWait(retryAfter))
+	default:
+		details += fmt.Sprintf("; confirm it again in %s.", humanWait(retryAfter))
+	}
+	return errorResponse{Error: "send rate limit", Details: details, RetryAfterMS: retryAfter.Milliseconds()}
+}
+
+// writeSendAnswer writes a send's answer, with Retry-After when it carries a
+// wait.
+func writeSendAnswer(w http.ResponseWriter, code int, body any) {
+	if e, ok := body.(errorResponse); ok && e.RetryAfterMS > 0 {
+		w.Header().Set("Retry-After", strconv.FormatInt(e.RetryAfterMS/1000+1, 10))
+	}
 	writeJSON(w, code, body)
 }
 
-// sendTurn is a send's place in its chat's queue: the governor's key for the
-// chat, and the moment Authorize scheduled it for.
-type sendTurn struct {
-	chat string
-	at   time.Time
+// humanWait says a wait the way a person would: "9s", "4m30s", "3h12m".
+func humanWait(d time.Duration) string {
+	switch {
+	case d < time.Second:
+		return "1s"
+	case d < time.Hour:
+		return d.Round(time.Second).String()
+	default:
+		return strings.TrimSuffix(d.Round(time.Minute).String(), "0s")
+	}
 }
 
 // uploadingHint tells a caller holding a 202 from confirm what to do next.
@@ -702,20 +735,19 @@ func (s *Server) awaitConnection(ctx context.Context, grace time.Duration) bool 
 // Every send type ends here: text inline from the handler, media from the job
 // that uploaded its file. ctx bounds the flip and the send; the bookkeeping
 // after a successful send is deliberately detached from it (see persistCtx).
-func (s *Server) commitSend(ctx context.Context, draftID string, recipient types.JID, recipientJID, recipientDisplay, mediaPath string, msg *waE2E.Message, turn sendTurn) (int, any) {
-	// Wait for this send's turn in its chat, while the draft is still a
-	// draft: giving up here (the caller hung up) leaves nothing half-done.
-	// Authorize scheduled the turn; ClaimSend also keeps the gap from a send
-	// that went out later than its turn, as a long upload's does.
-	if wait := time.Until(turn.at); wait > 0 {
-		select {
-		case <-ctx.Done():
-			return http.StatusServiceUnavailable, errorResponse{
-				Error: "send cancelled", Details: "the request ended while waiting its turn; nothing was sent and the draft can be confirmed again"}
-		case <-time.After(wait):
+//
+// chat is the governor's key for the recipient's chat, and maxWait how long
+// the send may wait there for its moment (see ClaimSend; negative: no bound).
+func (s *Server) commitSend(ctx context.Context, draftID string, recipient types.JID, recipientJID, recipientDisplay, mediaPath string, msg *waE2E.Message, chat string, maxWait time.Duration) (int, any) {
+	// Wait for this send's moment in its chat while the draft is still a
+	// draft: giving up here (the caller hung up, the line is too long)
+	// leaves nothing half-done and the draft reusable.
+	if err := s.sendGov().ClaimSend(ctx, chat, maxWait); err != nil {
+		var full *sendQueueFull
+		if errors.As(err, &full) {
+			log.Printf("send held back draft=%s recipient=%s: %v", draftID, recipientJID, err)
+			return http.StatusTooManyRequests, rateLimited(full.Error(), full.RetryAfter(), 0)
 		}
-	}
-	if err := s.sendGov().ClaimSend(ctx, turn.chat); err != nil {
 		return http.StatusServiceUnavailable, errorResponse{
 			Error: "send cancelled", Details: "the request ended while waiting its turn; nothing was sent and the draft can be confirmed again"}
 	}
@@ -730,6 +762,13 @@ func (s *Server) commitSend(ctx context.Context, draftID string, recipient types
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
+		// Another confirm of the same draft went first while this one waited
+		// for its moment. Answer with how that one ended — the delivery, if
+		// it went out — rather than a bare conflict that reads as "not sent"
+		// and invites a new draft and a second copy.
+		if code, body, settled := s.settledConfirm(ctx, draftID); settled {
+			return code, body
+		}
 		return http.StatusConflict, errorResponse{Error: "race: draft changed state during confirm"}
 	}
 
