@@ -178,14 +178,17 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			if !isPlumbing(msgType, content) {
 				res, err := b.db.Exec(`
 					INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
-						media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, media_filename)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+						media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, media_filename, raw_type)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 					ON CONFLICT(id) DO NOTHING
 				`, key.GetID(), chatJID, senderJID, senderDisplay, ts, msgType, content, normalized,
 					boolToInt(fromMe), scrubbed, ScrubFlagsJSON(flags),
 					mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
 					mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
-					mfields.MediaKeyTimestamp, mfields.MediaMime, mfields.MediaFilename)
+					mfields.MediaKeyTimestamp, mfields.MediaMime, mfields.MediaFilename,
+					// Without raw_type a marker stored from history never
+					// reached /healthcheck's decode counters (found 2026-10-21).
+					rawTypeNullable(msgType, content))
 				if err != nil {
 					log.Printf("history_sync: insert %s failed: %v", key.GetID(), err)
 					continue

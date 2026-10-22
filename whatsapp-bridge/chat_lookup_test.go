@@ -6,6 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 )
 
 func aliasPair(t *testing.T, db *sql.DB, a, b string) {
@@ -173,5 +178,49 @@ func TestHTMLIsSavedAsHTML(t *testing.T) {
 	}
 	if got := extensionForMime("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "document"); got != ".docx" {
 		t.Fatalf("docx → %s", got)
+	}
+}
+
+// TestHiddenMessagesKeepTheChatPreview: a revoke ("message deleted") used to
+// become the chat's last message, shown as "[unsupported: protocolMessage]".
+// It is still stored; the chat keeps showing the last real message.
+func TestHiddenMessagesKeepTheChatPreview(t *testing.T) {
+	db := undecodedTestDB(t)
+	b := &Bridge{db: db}
+	const ts = 1792557000
+
+	b.handleEvent(&events.Message{
+		Info:    parityTestInfo(t, "real-1", ts),
+		Message: &waE2E.Message{Conversation: proto.String("nos vemos a las 5")},
+	})
+	b.handleEvent(&events.Message{
+		Info: parityTestInfo(t, "revoke-1", ts+60),
+		Message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_REVOKE.Enum(),
+			Key:  &waCommon.MessageKey{ID: proto.String("real-1")},
+		}},
+	})
+
+	var preview, lastID string
+	if err := db.QueryRow(`SELECT COALESCE(last_message_preview, ''), COALESCE(last_message_id, '') FROM chats
+		WHERE jid = '12147735814-1589465137@g.us'`).Scan(&preview, &lastID); err != nil {
+		t.Fatal(err)
+	}
+	if preview != "nos vemos a las 5" || lastID != "real-1" {
+		t.Fatalf("the revoke replaced the chat's preview: %q (%s)", preview, lastID)
+	}
+	var stored int
+	db.QueryRow(`SELECT COUNT(*) FROM messages WHERE id = 'revoke-1'`).Scan(&stored)
+	if stored != 1 {
+		t.Fatal("a hidden message must still be stored")
+	}
+}
+
+func TestVideoNoteKeysAreKept(t *testing.T) {
+	f, ok := extractDownloadableFieldsFromProto(&waE2E.Message{
+		PtvMessage: &waE2E.VideoMessage{MediaKey: []byte("k"), DirectPath: proto.String("/v/ptv")},
+	})
+	if !ok || string(f.MediaKey) != "k" || f.MediaDirectPath.String != "/v/ptv" {
+		t.Fatalf("video note fields = %+v (ok=%v)", f, ok)
 	}
 }

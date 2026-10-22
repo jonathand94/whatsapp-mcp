@@ -323,7 +323,7 @@ func eventText(e *waE2E.EventMessage) string {
 	}
 	parts := []string{e.GetName(), e.GetDescription(), e.GetLocation().GetName()}
 	if e.GetIsCanceled() {
-		parts = append(parts, "(canceled)")
+		parts = append(parts, "(cancelado)")
 	}
 	return joinNonEmpty("\n", parts...)
 }

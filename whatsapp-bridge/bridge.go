@@ -417,18 +417,33 @@ func (b *Bridge) onMessage(evt *events.Message) {
 		chatName = sql.NullString{String: n, Valid: true}
 		chatNameNorm = sql.NullString{String: Normalize(n), Valid: true}
 	}
-	_, err := b.db.Exec(`
-		INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at, last_message_id, last_message_time, last_message_preview)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(jid) DO UPDATE SET
-			name = COALESCE(excluded.name, chats.name),
-			normalized_name = COALESCE(excluded.normalized_name, chats.normalized_name),
-			last_message_id = excluded.last_message_id,
-			last_message_time = excluded.last_message_time,
-			last_message_preview = excluded.last_message_preview,
-			updated_at = excluded.updated_at
-	`, chatJID, chatTypeFromJID(evt.Info.Chat), chatName, chatNameNorm,
-		ts, ts, id, chatSortTime(ts, time.Now()), truncate(content, 120))
+	// A message the user never sees in WhatsApp's chat list — a revoke, a
+	// disappearing-messages setting, an encrypted poll vote — is stored, but
+	// does not become the chat's last message: chats used to show
+	// "[unsupported: protocolMessage]" as their preview. The chat row is
+	// still created when missing, since messages.chat_jid references it.
+	// See hiddenFromChatPreview in content_decode.go.
+	var err error
+	if hiddenFromChatPreview(evt.Message) {
+		_, err = b.db.Exec(`
+			INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(jid) DO NOTHING
+		`, chatJID, chatTypeFromJID(evt.Info.Chat), chatName, chatNameNorm, ts, ts)
+	} else {
+		_, err = b.db.Exec(`
+			INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at, last_message_id, last_message_time, last_message_preview)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(jid) DO UPDATE SET
+				name = COALESCE(excluded.name, chats.name),
+				normalized_name = COALESCE(excluded.normalized_name, chats.normalized_name),
+				last_message_id = excluded.last_message_id,
+				last_message_time = excluded.last_message_time,
+				last_message_preview = excluded.last_message_preview,
+				updated_at = excluded.updated_at
+		`, chatJID, chatTypeFromJID(evt.Info.Chat), chatName, chatNameNorm,
+			ts, ts, id, chatSortTime(ts, time.Now()), truncate(content, 120))
+	}
 	if err != nil {
 		log.Printf("onMessage: chat upsert failed: %v", err)
 	}

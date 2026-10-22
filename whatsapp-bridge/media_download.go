@@ -138,6 +138,12 @@ func extractDownloadableFieldsFromProto(m *waE2E.Message) (mediaFields, bool) {
 	if x := m.GetVideoMessage(); x != nil {
 		return fieldsFrom(x), true
 	}
+	// A video note is a VideoMessage in its own field. It is stored as type
+	// "video", and without this its keys were never kept, so it could not be
+	// downloaded later.
+	if x := m.GetPtvMessage(); x != nil {
+		return fieldsFrom(x), true
+	}
 	if x := m.GetDocumentMessage(); x != nil {
 		f := fieldsFrom(x)
 		if name := strings.TrimSpace(x.GetFileName()); name != "" {
