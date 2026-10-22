@@ -226,7 +226,9 @@ func unwrapOnce(m *waE2E.Message) *waE2E.Message {
 func envelopeUnknownFields(m *waE2E.Message) []string {
 	var names []string
 	seen := map[protowire.Number]bool{}
-	for depth := 0; m != nil && depth < maxUnwrapDepth; depth++ {
+	// <=: unwrapEnvelope descends maxUnwrapDepth times, so the message it
+	// returns is at that depth, and is checked too.
+	for depth := 0; m != nil && depth <= maxUnwrapDepth; depth++ {
 		names = append(names, unknownFieldNames(m.ProtoReflect(), seen)...)
 		m = unwrapOnce(m)
 	}

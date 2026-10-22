@@ -421,3 +421,17 @@ func TestAPersonWithThreeJIDsIsOnePerson(t *testing.T) {
 		t.Fatalf("new number: key %q (old %q), new=%t, err %v", keyNew, keyOld, isNew, err)
 	}
 }
+
+// TestUnknownFieldsAtTheDeepestLevelAreKept: unwrapEnvelope returns a message
+// maxUnwrapDepth wrappers down, and that message is checked for fields from a
+// newer WhatsApp too (2026-10-21 review: it was one level short).
+func TestUnknownFieldsAtTheDeepestLevelAreKept(t *testing.T) {
+	m := withUnknownField(&waE2E.Message{}, 989)
+	for i := 0; i < maxUnwrapDepth; i++ {
+		m = &waE2E.Message{EphemeralMessage: &waE2E.FutureProofMessage{Message: m}}
+	}
+	text, _ := extractContentFromProto(m)
+	if isPlumbing(m) || !strings.Contains(text, "unknown_field_989") {
+		t.Fatalf("isPlumbing=%t, decoded %q", isPlumbing(m), text)
+	}
+}

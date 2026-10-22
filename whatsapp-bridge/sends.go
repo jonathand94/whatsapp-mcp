@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
@@ -476,6 +477,13 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ticket := &sendTicket{gov: gov, decision: d}
+	if upload := sendType == "file" || sendType == "audio"; !upload {
+		// Settles the ticket on any path that did not, a panic included
+		// (net/http recovers it): a turn never given back would block every
+		// later send to this chat until a restart. After abandon or sent it
+		// does nothing. An upload's ticket belongs to its job (see there).
+		defer ticket.abandon()
+	}
 
 	// Build the outbound message based on send type.
 	var msg *waE2E.Message
@@ -630,11 +638,6 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	// A text is ready the moment it is confirmed, and its caller is waiting
 	// on this request, so it waits for its turn in the chat only up to
 	// MaxTextWait. Giving up leaves nothing half-done and the draft usable.
-	// The deferred abandon settles the ticket on any path that did not, a
-	// panic included (net/http recovers it): a turn never given back would
-	// block every later send to this chat until a restart. After abandon or
-	// sent it does nothing.
-	defer ticket.abandon()
 	release, err := gov.ClaimSend(r.Context(), chatKey, gov.limits.MaxTextWait)
 	if err != nil {
 		ticket.abandon()
@@ -669,12 +672,20 @@ type sendTicket struct {
 	gov      *sendGovernor
 	decision sendDecision
 	release  func(sentAt time.Time)
+	// flipped: the draft is 'confirmed' and the send is under way, so the
+	// message may leave from here on.
+	flipped bool
 }
 
 // abandon settles a ticket whose message was not sent and whose draft stays
 // usable: the next send in the chat's line goes at once, and the volume it
-// counted is given back.
+// counted is given back. Past the flip nothing is known to be unsent (a panic
+// mid-send lands here), so it settles as sent instead.
 func (t *sendTicket) abandon() {
+	if t.flipped {
+		t.sent(time.Now())
+		return
+	}
 	if t.release != nil {
 		t.release(time.Time{})
 		t.release = nil
@@ -693,10 +704,30 @@ func (t *sendTicket) sent(sentAt time.Time) {
 	t.decision = sendDecision{}
 }
 
-// sendTimeoutNotice is stored on a send WhatsApp did not acknowledge in time.
-// It may have arrived, so the reader is told to look before sending again.
-const sendTimeoutNotice = "WhatsApp did not acknowledge the send in time; " +
+// sendTimeoutNotice is stored on a send whose outcome WhatsApp never
+// confirmed. It may have arrived, so the reader is told to look before
+// sending again.
+const sendTimeoutNotice = "WhatsApp did not confirm the send; " +
 	"DELIVERY IS UNKNOWN — check the chat in WhatsApp before resending"
+
+// failedBeforeLeaving reports whether a SendMessage error proves the message
+// was not delivered: refused before anything was sent, or rejected by
+// WhatsApp's server. Everything else may have come after it left — no
+// acknowledgement in time, or the connection dropping while waiting for one
+// (whatsmeow resends after a reconnect and gives up if none comes within
+// 5 s) — and is treated as delivery unknown: a duplicate in a real person's
+// chat is worse than asking the user to look (2026-10-21 review).
+func failedBeforeLeaving(err error) bool {
+	for _, definite := range []error{
+		whatsmeow.ErrServerReturnedError, whatsmeow.ErrNotLoggedIn, whatsmeow.ErrRecipientADJID,
+		whatsmeow.ErrUnknownServer, whatsmeow.ErrClientIsNil, whatsmeow.ErrInvalidInlineBotID,
+	} {
+		if errors.Is(err, definite) {
+			return true
+		}
+	}
+	return false
+}
 
 // rateLimited is the answer to a send the governor holds back. The wait goes
 // in the details as well as in Retry-After and retry_after_ms, because the MCP
@@ -851,6 +882,7 @@ func (s *Server) commitSend(ctx context.Context, draftID string, recipient types
 		}
 		return http.StatusConflict, errorResponse{Error: "race: draft changed state during confirm"}
 	}
+	ticket.flipped = true
 
 	// From here on the draft is 'confirmed' and the send must run to its end
 	// whatever happens to the request. A text's context is its HTTP request:
@@ -866,18 +898,22 @@ func (s *Server) commitSend(ctx context.Context, draftID string, recipient types
 	defer cancel()
 
 	// Execute the send. This is the only place an actual outbound network call happens.
-	sendStarted := time.Now()
 	sendResp, sendErr := s.bridge.client.SendMessage(sendCtx, recipient, msg)
-	ticket.sent(sendStarted)
+	// The next send to the chat keeps its gap from now, not from the call:
+	// SendMessage fetches device lists and keys before the message leaves,
+	// which can take seconds (2026-10-21 review), and the message has always
+	// left by the time it returns.
+	ticket.sent(time.Now())
 	if sendErr != nil {
 		log.Printf("send failed draft=%s recipient=%s: %v", draftID, recipientJID, sendErr)
-		// A send WhatsApp did not acknowledge in time may have arrived: the
-		// draft cannot be retried, and the answer says to look first.
+		// Unless the error proves nothing left, the message may have arrived:
+		// the draft cannot be retried, and the answer says to look first.
 		code, notice, answer := http.StatusBadGateway, sendErr.Error(), errorResponse{Error: "send failed", Details: sendErr.Error()}
-		if errors.Is(sendErr, context.DeadlineExceeded) {
-			code, notice = http.StatusGatewayTimeout, sendTimeoutNotice
+		if !failedBeforeLeaving(sendErr) {
+			code, notice = http.StatusGatewayTimeout, sendTimeoutNotice+" ("+sendErr.Error()+")"
 			answer = errorResponse{Error: "delivery unknown",
-				Details: "WhatsApp no confirmo el envio a tiempo: pudo haber llegado o no. Revisa el chat en WhatsApp antes de enviarlo de nuevo"}
+				Details: "WhatsApp no confirmo el envio (" + sendErr.Error() + "): pudo haber llegado o no. " +
+					"Revisa el chat en WhatsApp antes de enviarlo de nuevo"}
 		}
 		_, _ = s.db.ExecContext(persistCtx,
 			`UPDATE sends SET status='failed', error_message=? WHERE draft_id=?`,

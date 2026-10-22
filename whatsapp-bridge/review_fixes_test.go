@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -507,4 +508,53 @@ func TestATurnIsGivenBackWhenTheSendPanics(t *testing.T) {
 		t.Fatalf("the chat is still blocked after the panic: %v", err)
 	}
 	release(time.Time{})
+}
+
+// TestOnlyProvenFailuresAreReportedAsFailed: a send error that does not prove
+// the message stayed home is "delivery unknown", so the answer never invites
+// a duplicate (2026-10-21 review).
+func TestOnlyProvenFailuresAreReportedAsFailed(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		sure bool
+	}{
+		{fmt.Errorf("%w 479", whatsmeow.ErrServerReturnedError), true},
+		{whatsmeow.ErrNotLoggedIn, true},
+		{whatsmeow.ErrRecipientADJID, true},
+		{&whatsmeow.DisconnectedError{Action: "message send"}, false},
+		{context.DeadlineExceeded, false},
+		{whatsmeow.ErrMessageTimedOut, false},
+		{fmt.Errorf("failed to send message node: %w", whatsmeow.ErrNotConnected), false},
+		{errors.New("something new"), false},
+	} {
+		if got := failedBeforeLeaving(c.err); got != c.sure {
+			t.Errorf("%v: failedBeforeLeaving = %t, want %t", c.err, got, c.sure)
+		}
+	}
+}
+
+// TestAPanicMidSendKeepsTheGap: once the draft is flipped the message may
+// have left, so a panic there settles the ticket as sent — the count stays
+// and the next send keeps its gap.
+func TestAPanicMidSendKeepsTheGap(t *testing.T) {
+	lim := defaultSendLimits()
+	lim.MinGapSameChat = 150 * time.Millisecond
+	g := newSendGovernor(lim)
+	ticket := &sendTicket{gov: g, decision: g.Authorize("chat-f", false, time.Now())}
+	release, err := g.ClaimSend(t.Context(), "chat-f", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.release = release
+	ticket.flipped = true
+	ticket.abandon() // what the deferred abandon does after a panic in SendMessage
+	if sent := g.Snapshot(time.Now())["sent_last_hour"].(int); sent != 1 {
+		t.Fatalf("the send was refunded although it may have left: %d", sent)
+	}
+	start := time.Now()
+	next, err := g.ClaimSend(t.Context(), "chat-f", -1)
+	if err != nil || time.Since(start) < 100*time.Millisecond {
+		t.Fatalf("the next send did not keep the gap (%s, %v)", time.Since(start), err)
+	}
+	next(time.Time{})
 }
