@@ -10,6 +10,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -222,5 +223,47 @@ func TestVideoNoteKeysAreKept(t *testing.T) {
 	})
 	if !ok || string(f.MediaKey) != "k" || f.MediaDirectPath.String != "/v/ptv" {
 		t.Fatalf("video note fields = %+v (ok=%v)", f, ok)
+	}
+}
+
+func withUnknownField(m *waE2E.Message, field protowire.Number) *waE2E.Message {
+	raw := protowire.AppendTag(nil, field, protowire.BytesType)
+	raw = protowire.AppendBytes(raw, []byte{0x0a, 0x01, 'x'})
+	m.ProtoReflect().SetUnknown(raw)
+	return m
+}
+
+// TestNewerWhatsAppContentIsKept: a payload whatsmeow cannot parse has no
+// known fields, like plumbing, but must not be dropped like plumbing — it
+// gets a marker and stays visible, plain or inside a disappearing-message
+// envelope.
+func TestNewerWhatsAppContentIsKept(t *testing.T) {
+	db := undecodedTestDB(t)
+	b := &Bridge{db: db}
+	const ts = 1792557000
+
+	plain := withUnknownField(&waE2E.Message{MessageContextInfo: &waE2E.MessageContextInfo{}}, 999)
+	wrapped := &waE2E.Message{EphemeralMessage: &waE2E.FutureProofMessage{
+		Message: withUnknownField(&waE2E.Message{}, 998)}}
+	for id, m := range map[string]*waE2E.Message{"new-1": plain, "new-2": wrapped} {
+		if isPlumbing(m) {
+			t.Fatalf("%s: newer content classified as plumbing", id)
+		}
+		b.handleEvent(&events.Message{Info: parityTestInfo(t, id, ts), Message: m})
+	}
+	var markers int
+	db.QueryRow(`SELECT COUNT(*) FROM messages WHERE id IN ('new-1','new-2') AND content_text LIKE '[unsupported: unknown_field_%'`).Scan(&markers)
+	if markers != 2 {
+		t.Fatalf("want both stored with an unknown_field marker, got %d", markers)
+	}
+
+	// Plumbing whose metadata has fields newer than whatsmeow is still plumbing:
+	// only the envelope decides, not a carrier's insides.
+	ctx := &waE2E.MessageContextInfo{}
+	raw := protowire.AppendTag(nil, 500, protowire.VarintType)
+	raw = protowire.AppendVarint(raw, 1)
+	ctx.ProtoReflect().SetUnknown(raw)
+	if !isPlumbing(&waE2E.Message{MessageContextInfo: ctx, SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{}}) {
+		t.Fatal("new fields inside messageContextInfo made key distribution look like content")
 	}
 }

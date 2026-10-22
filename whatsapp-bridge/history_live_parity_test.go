@@ -204,8 +204,11 @@ func TestHistorySyncAndLiveAgreeOnAContentFreeMessage(t *testing.T) {
 	if histType != "system" || histText != "" {
 		t.Fatalf("the old row changed: (%q, %q)", histType, histText)
 	}
-	if !isPlumbing("system", "") || isPlumbing("system", "[unsupported: pinInChatMessage]") || isPlumbing("text", "") {
-		t.Fatal("isPlumbing must be exactly: system with no content")
+	if !isPlumbing(&waE2E.Message{SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{}}) {
+		t.Fatal("a key-distribution-only message is plumbing")
+	}
+	if isPlumbing(&waE2E.Message{Conversation: proto.String("hola")}) {
+		t.Fatal("a text is not plumbing")
 	}
 }
 

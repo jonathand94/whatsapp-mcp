@@ -175,7 +175,7 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			// so a backfilled row is indistinguishable from a live one.
 			// Plumbing (see isPlumbing) is not stored; the walk below still
 			// counts it, since it is part of the chunk's history.
-			if !isPlumbing(msgType, content) {
+			if !isPlumbing(wm.GetMessage()) {
 				res, err := b.db.Exec(`
 					INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
 						media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, media_filename, raw_type)

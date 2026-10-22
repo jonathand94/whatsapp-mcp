@@ -18,6 +18,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
@@ -372,7 +373,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	ts := evt.Info.Timestamp.Unix()
 
 	content, msgType := extractContent(evt)
-	if isPlumbing(msgType, content) {
+	if isPlumbing(evt.Message) {
 		// Nothing to store, and nothing for the chat list (see isPlumbing).
 		// What such a message does teach — which phone number a @lid is —
 		// is still recorded.
@@ -754,14 +755,63 @@ var carrierFields = map[string]bool{
 	"senderKeyDistributionMessage": true,
 }
 
-// isPlumbing reports whether a decoded message has nothing for a person in it:
-// only carrier fields (Signal group-key distribution, context metadata), which
-// is how extractContent comes to return an empty "system". WhatsApp shows
-// nothing for these. Stored, they were blank rows in the chat — over 24,000 by
-// October 2026, a few more with every group key rotation — and each one
-// replaced its chat's preview and time with nothing. They are not stored.
-func isPlumbing(msgType, content string) bool {
-	return msgType == "system" && content == ""
+// isPlumbing reports whether a message has nothing for a person in it: once
+// unwrapped, every field it carries is a carrier (Signal group-key
+// distribution, context metadata — carrierFields), and nothing anywhere in its
+// envelope is a field this whatsmeow cannot parse. WhatsApp shows nothing for
+// these. Stored, they were blank rows in the chat — over 24,000 by October
+// 2026, a few more with every group key rotation — and each one replaced its
+// chat's preview and time with nothing. They are not stored.
+//
+// The unparseable-field condition is what keeps this from swallowing content
+// from a newer WhatsApp: a message whose payload is a type newer than the
+// pinned whatsmeow has no known fields either, and must stay visible (it gets
+// an "unknown_field_N" marker from unsupportedMessageType).
+func isPlumbing(raw *waE2E.Message) bool {
+	if raw == nil {
+		return true
+	}
+	if hasUnreadableFields(raw.ProtoReflect()) {
+		return false
+	}
+	m := unwrapEnvelope(raw)
+	if m == nil {
+		return true
+	}
+	onlyCarriers := true
+	m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		onlyCarriers = carrierFields[string(fd.Name())]
+		return onlyCarriers
+	})
+	return onlyCarriers
+}
+
+// envelopeTypes are the message types an envelope is made of: the message
+// itself and the wrappers around it.
+var envelopeTypes = map[protoreflect.FullName]bool{
+	(&waE2E.Message{}).ProtoReflect().Descriptor().FullName():            true,
+	(&waE2E.FutureProofMessage{}).ProtoReflect().Descriptor().FullName(): true,
+	(&waE2E.DeviceSentMessage{}).ProtoReflect().Descriptor().FullName():  true,
+}
+
+// hasUnreadableFields reports whether m, or any message along its envelope,
+// carries fields this whatsmeow cannot parse (protobuf "unknown fields") —
+// that is, content from a newer WhatsApp. Only the envelope is examined:
+// unknown fields inside a known content message or a carrier belong to that
+// message, which is already classified by its known type.
+func hasUnreadableFields(m protoreflect.Message) bool {
+	if len(m.GetUnknown()) > 0 {
+		return true
+	}
+	found := false
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		if fd.Kind() == protoreflect.MessageKind && !fd.IsList() && !fd.IsMap() &&
+			envelopeTypes[fd.Message().FullName()] && hasUnreadableFields(v.Message()) {
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 // unsupportedMessageType names the populated content field(s) of a message
@@ -786,6 +836,25 @@ func unsupportedMessageType(m proto.Message) string {
 		}
 		return true
 	})
+	// Fields from a newer WhatsApp are not visited by Range at all. Named by
+	// number, so a message made only of them gets a marker instead of passing
+	// for an empty one.
+	seen := map[protowire.Number]bool{}
+	for unknown := r.GetUnknown(); len(unknown) > 0; {
+		num, typ, n := protowire.ConsumeTag(unknown)
+		if n < 0 {
+			break
+		}
+		unknown = unknown[n:]
+		if n = protowire.ConsumeFieldValue(num, typ, unknown); n < 0 {
+			break
+		}
+		unknown = unknown[n:]
+		if !seen[num] {
+			seen[num] = true
+			names = append(names, fmt.Sprintf("unknown_field_%d", num))
+		}
+	}
 	if len(names) == 0 {
 		return ""
 	}

@@ -614,6 +614,11 @@ func joinNonEmpty(sep string, vals ...string) string {
 // unsupportedMessageType: a message made only of those is stored as an empty
 // row, and is hidden like one.
 func hiddenFromChatPreview(m *waE2E.Message) bool {
+	// Content from a newer WhatsApp gets a marker and stays visible (see
+	// isPlumbing and unsupportedMessageType in bridge.go).
+	if m != nil && hasUnreadableFields(m.ProtoReflect()) {
+		return false
+	}
 	m = unwrapEnvelope(m)
 	if m == nil {
 		return true
