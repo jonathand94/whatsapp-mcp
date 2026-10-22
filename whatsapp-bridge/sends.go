@@ -462,13 +462,20 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	d := s.sendGov().Authorize(chatKey, isNewChat, time.Now())
+	gov := s.sendGov()
+	draftLeft := time.Until(time.Unix(createdAt+draftTTLSeconds, 0))
+	var d sendDecision
+	if sendType == "file" || sendType == "audio" {
+		d = gov.AuthorizeUpload(chatKey, isNewChat, time.Now())
+	} else {
+		d = gov.Authorize(chatKey, isNewChat, time.Now())
+	}
 	if !d.Allow {
 		log.Printf("send throttled draft=%s recipient=%s new_chat=%t: %s", draftID, recipientJID, isNewChat, d.Reason)
-		draftLeft := time.Until(time.Unix(createdAt+draftTTLSeconds, 0))
 		writeSendAnswer(w, http.StatusTooManyRequests, rateLimited(d.Reason, d.RetryAfter, draftLeft))
 		return
 	}
+	ticket := &sendTicket{gov: gov, decision: d}
 
 	// Build the outbound message based on send type.
 	var msg *waE2E.Message
@@ -533,7 +540,7 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 			VoiceNote:  mediaVoiceNote == 1,
 			FFmpegBin:  s.cfg.FFmpegBinPath,
 		}
-		up, _ := s.jobs().start("send:"+draftID, func(j *mediaJob) (int, any) {
+		up, started := s.jobs().start("send:"+draftID, func(j *mediaJob) (int, any) {
 			ctx, cancel := context.WithTimeout(s.rootContext(), mediaJobTimeout)
 			defer cancel()
 
@@ -541,6 +548,7 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 			// between this request's checks and this job starting. The row
 			// knows; the request that started the job does not.
 			if code, body, settled := s.settledConfirm(ctx, draftID); settled {
+				ticket.abandon()
 				return code, body
 			}
 
@@ -557,18 +565,33 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 					err = fmt.Errorf("la subida se detuvo: no se movieron datos en %s", stallTimeout)
 				}
 				log.Printf("media upload failed draft=%s: %v", draftID, err)
+				ticket.abandon()
 				return http.StatusBadGateway, errorResponse{
 					Error:   "media upload failed",
 					Details: err.Error() + ". Nothing was sent and the draft can be confirmed again.",
 				}
 			}
 
+			// The upload is done and paid for, so the send waits for its turn
+			// however long the chat's line is: the job has no caller holding
+			// a connection open.
+			j.setPhase("esperando su turno en el chat")
+			release, err := gov.ClaimSend(ctx, chatKey, -1)
+			if err != nil {
+				ticket.abandon()
+				return http.StatusServiceUnavailable, errorResponse{
+					Error: "send cancelled", Details: "el envio se interrumpio esperando su turno; nada se envio y el borrador sigue vigente"}
+			}
+			ticket.release = release
+
 			// An upload can take hours, and the connection can drop in the
-			// meantime. Sending now would fail before anything left this
-			// machine and burn the draft as 'failed'; waiting a little for
-			// the reconnect, and otherwise leaving the draft a draft, keeps it
-			// usable.
+			// meantime, or while the send waits its turn. Sending now would
+			// fail before anything left this machine and burn the draft as
+			// 'failed', file and all; waiting a little for the reconnect, and
+			// otherwise leaving the draft a draft, keeps it usable. Checked
+			// last, right before the send, so no wait comes after it.
 			if !s.awaitConnection(ctx, reconnectGrace) {
+				ticket.abandon()
 				return http.StatusServiceUnavailable, errorResponse{
 					Error: "bridge not connected to WhatsApp",
 					Details: "el archivo se subio, pero WhatsApp se desconecto antes de enviarlo. " +
@@ -576,11 +599,13 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			j.setPhase("enviando el mensaje")
-			// The upload is done and paid for, so the send waits for its
-			// moment however long the chat's line is; the job has no caller
-			// holding a connection open.
-			return s.commitSend(ctx, draftID, recipient, recipientJID, recipientDisplay, mediaPath, built, chatKey, -1)
+			return s.commitSend(ctx, draftID, recipient, recipientJID, recipientDisplay, mediaPath, built, ticket)
 		})
+		if !started {
+			// A confirm that raced this one already started the upload, and
+			// this one only joins it.
+			ticket.abandon()
+		}
 		answerJob(w, r, up, jobPending{
 			DraftID:          draftID,
 			RecipientJID:     recipientJID,
@@ -598,12 +623,70 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A text is ready the moment it is confirmed, and its caller is waiting
-	// on this request, so it waits for its moment only as long as the
-	// governor lets anything line up.
-	code, body := s.commitSend(r.Context(), draftID, recipient, recipientJID, recipientDisplay, "", msg,
-		chatKey, s.sendGov().limits.MaxWaitSameChat)
+	// on this request, so it waits for its turn in the chat only up to
+	// MaxTextWait. Giving up leaves nothing half-done and the draft usable.
+	release, err := gov.ClaimSend(r.Context(), chatKey, gov.limits.MaxTextWait)
+	if err != nil {
+		ticket.abandon()
+		var full *sendQueueFull
+		if errors.As(err, &full) {
+			log.Printf("send held back draft=%s recipient=%s: %v", draftID, recipientJID, err)
+			writeSendAnswer(w, http.StatusTooManyRequests, rateLimited(full.Error(), full.RetryAfter(), draftLeft))
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+			Error: "send cancelled", Details: "the request ended while waiting its turn; nothing was sent and the draft can be confirmed again"})
+		return
+	}
+	ticket.release = release
+	if !s.bridge.IsConnected() {
+		ticket.abandon()
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+			Error:   "bridge not connected to WhatsApp",
+			Details: "the connection dropped while the message waited its turn; nothing was sent and the draft can be confirmed again",
+		})
+		return
+	}
+	code, body := s.commitSend(r.Context(), draftID, recipient, recipientJID, recipientDisplay, "", msg, ticket)
 	writeSendAnswer(w, code, body)
 }
+
+// sendTicket is a confirm's standing with the governor between Authorize and
+// the network call: the volume it counted and, once ClaimSend let it through,
+// its turn in the chat's line. abandon or sent settles it; the first call
+// wins.
+type sendTicket struct {
+	gov      *sendGovernor
+	decision sendDecision
+	release  func(sentAt time.Time)
+}
+
+// abandon settles a ticket whose message was not sent and whose draft stays
+// usable: the next send in the chat's line goes at once, and the volume it
+// counted is given back.
+func (t *sendTicket) abandon() {
+	if t.release != nil {
+		t.release(time.Time{})
+		t.release = nil
+	}
+	t.gov.Refund(t.decision)
+	t.decision = sendDecision{}
+}
+
+// sent settles a ticket whose message went out at sentAt, or may have: the
+// next send to the chat keeps its gap from that moment.
+func (t *sendTicket) sent(sentAt time.Time) {
+	if t.release != nil {
+		t.release(sentAt)
+		t.release = nil
+	}
+	t.decision = sendDecision{}
+}
+
+// sendTimeoutNotice is stored on a send WhatsApp did not acknowledge in time.
+// It may have arrived, so the reader is told to look before sending again.
+const sendTimeoutNotice = "WhatsApp did not acknowledge the send in time; " +
+	"DELIVERY IS UNKNOWN — check the chat in WhatsApp before resending"
 
 // rateLimited is the answer to a send the governor holds back. The wait goes
 // in the details as well as in Retry-After and retry_after_ms, because the MCP
@@ -733,64 +816,68 @@ func (s *Server) awaitConnection(ctx context.Context, grace time.Duration) bool 
 
 // commitSend flips a draft to 'confirmed', sends msg, and records the result.
 // Every send type ends here: text inline from the handler, media from the job
-// that uploaded its file. ctx bounds the flip and the send; the bookkeeping
-// after a successful send is deliberately detached from it (see persistCtx).
-//
-// chat is the governor's key for the recipient's chat, and maxWait how long
-// the send may wait there for its moment (see ClaimSend; negative: no bound).
-func (s *Server) commitSend(ctx context.Context, draftID string, recipient types.JID, recipientJID, recipientDisplay, mediaPath string, msg *waE2E.Message, chat string, maxWait time.Duration) (int, any) {
-	// Wait for this send's moment in its chat while the draft is still a
-	// draft: giving up here (the caller hung up, the line is too long)
-	// leaves nothing half-done and the draft reusable.
-	if err := s.sendGov().ClaimSend(ctx, chat, maxWait); err != nil {
-		var full *sendQueueFull
-		if errors.As(err, &full) {
-			log.Printf("send held back draft=%s recipient=%s: %v", draftID, recipientJID, err)
-			return http.StatusTooManyRequests, rateLimited(full.Error(), full.RetryAfter(), 0)
-		}
-		return http.StatusServiceUnavailable, errorResponse{
-			Error: "send cancelled", Details: "the request ended while waiting its turn; nothing was sent and the draft can be confirmed again"}
-	}
-
+// that uploaded its file, each holding its turn in the chat's line (ticket),
+// which commitSend settles. ctx bounds the flip; from the flip on, nothing
+// may be abandoned because the caller went away (see sendCtx and persistCtx).
+func (s *Server) commitSend(ctx context.Context, draftID string, recipient types.JID, recipientJID, recipientDisplay, mediaPath string, msg *waE2E.Message, ticket *sendTicket) (int, any) {
 	// Flip to confirmed BEFORE sending, so double-confirm races are blocked.
 	now := time.Now().Unix()
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE sends SET status='confirmed', confirmed_at=? WHERE draft_id=? AND status='draft'`,
 		now, draftID)
 	if err != nil {
+		ticket.abandon()
 		return http.StatusInternalServerError, errorResponse{Error: "confirm update failed", Details: err.Error()}
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
 		// Another confirm of the same draft went first while this one waited
-		// for its moment. Answer with how that one ended — the delivery, if
-		// it went out — rather than a bare conflict that reads as "not sent"
-		// and invites a new draft and a second copy.
+		// for its turn. Answer with how that one ended — the delivery, if it
+		// went out — rather than a bare conflict that reads as "not sent" and
+		// invites a new draft and a second copy.
+		ticket.abandon()
 		if code, body, settled := s.settledConfirm(ctx, draftID); settled {
 			return code, body
 		}
 		return http.StatusConflict, errorResponse{Error: "race: draft changed state during confirm"}
 	}
 
-	// Execute the send. This is the only place an actual outbound network call happens.
-	sendCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// From here on the draft is 'confirmed' and the send must run to its end
+	// whatever happens to the request. A text's context is its HTTP request:
+	// when the MCP client gave up at 30 s, the cancelled request used to
+	// cancel SendMessage after the message had already left, the draft was
+	// marked 'failed', and the answer invited sending it again — a duplicate
+	// for the recipient (2026-10-21 review). Both contexts below are detached
+	// from the caller and bounded by their own timeouts; what no handler can
+	// prevent is the process stopping — see ReconcileInFlightSends.
+	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+	defer cancelPersist()
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 
+	// Execute the send. This is the only place an actual outbound network call happens.
+	sendStarted := time.Now()
 	sendResp, sendErr := s.bridge.client.SendMessage(sendCtx, recipient, msg)
+	ticket.sent(sendStarted)
 	if sendErr != nil {
 		log.Printf("send failed draft=%s recipient=%s: %v", draftID, recipientJID, sendErr)
-		_, _ = s.db.ExecContext(ctx,
+		// A send WhatsApp did not acknowledge in time may have arrived: the
+		// draft cannot be retried, and the answer says to look first.
+		code, notice, answer := http.StatusBadGateway, sendErr.Error(), errorResponse{Error: "send failed", Details: sendErr.Error()}
+		if errors.Is(sendErr, context.DeadlineExceeded) {
+			code, notice = http.StatusGatewayTimeout, sendTimeoutNotice
+			answer = errorResponse{Error: "delivery unknown",
+				Details: "WhatsApp no confirmo el envio a tiempo: pudo haber llegado o no. Revisa el chat en WhatsApp antes de enviarlo de nuevo"}
+		}
+		_, _ = s.db.ExecContext(persistCtx,
 			`UPDATE sends SET status='failed', error_message=? WHERE draft_id=?`,
-			sendErr.Error(), draftID)
+			notice, draftID)
 		// A failed draft can never be confirmed again, so its bytes — up to
 		// 2 GB now — are dead weight from here on.
 		if rmErr := removeOutboundFile(mediaPath); rmErr != nil {
 			log.Printf("draft %s failed; removing %s failed: %v", draftID, mediaPath, rmErr)
 		}
-		return http.StatusBadGateway, errorResponse{
-			Error:   "send failed",
-			Details: sendErr.Error(),
-		}
+		return code, answer
 	}
 
 	sentAt := time.Now().Unix()
@@ -807,13 +894,8 @@ func (s *Server) commitSend(ctx context.Context, draftID string, recipient types
 	// does not know about. This deployment's logs already show `context canceled`
 	// killing other queries, so it was never hypothetical.
 	//
-	// WithoutCancel detaches from the request; the fresh timeout keeps it
-	// bounded, so a wedged DB cannot hang the handler either. What no handler can
-	// prevent is the process stopping here — see ReconcileInFlightSends.
-	persistCtx, cancelPersist := context.WithTimeout(
-		context.WithoutCancel(ctx), 15*time.Second)
-	defer cancelPersist()
-
+	// persistCtx (above) detaches from the request; its timeout keeps it
+	// bounded, so a wedged DB cannot hang the handler either.
 	if _, err := s.db.ExecContext(persistCtx,
 		`UPDATE sends SET status='sent', sent_at=?, whatsapp_message_id=? WHERE draft_id=?`,
 		sentAt, whatsappID, draftID); err != nil {

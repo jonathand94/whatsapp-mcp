@@ -19,10 +19,11 @@
 // bounded. An assistant asked to send five files to one person confirms the
 // five drafts at once; refusing four of them for arriving 2 s apart (as the
 // 2026-10-21 test run saw) is not safety, it is a chore. So a send that only
-// lacks spacing waits its turn — the gap is still enforced, at the moment of
-// sending (ClaimSend) — but only a few sends may be lined up in one chat at a
-// time (MaxWaitSameChat). Past that the queue is a burst, and the burst is
-// refused like any other.
+// lacks spacing waits its turn in the chat's line (ClaimSend): one send at a
+// time, in the order they became ready, each MinGapSameChat after the
+// previous one actually went out. The line is short — a few uploads per chat
+// (MaxWaitSameChat), and a text waits at most MaxTextWait — and past that
+// the queue is a burst, refused like any other.
 //
 // The limits are deliberately not tuned to WhatsApp's real (unpublished)
 // thresholds, which nobody outside Meta knows. They are tuned to what this
@@ -49,11 +50,15 @@ type sendLimits struct {
 	// is, and it is also what a runaway loop produces first.
 	MinGapSameChat time.Duration
 
-	// How far ahead sends to one chat may be lined up before the next one is
-	// refused instead: four sends 5 s apart; a fifth is a burst. It is also
-	// the longest a text waits for its moment (ClaimSend), which keeps a text
-	// confirm well inside the 30 s its HTTP caller waits.
+	// How many uploads one chat may have lined up, as time: four turns 5 s
+	// apart; a fifth upload confirmed at once is a burst. Uploads take these
+	// turns when confirmed, long before they send (AuthorizeUpload).
 	MaxWaitSameChat time.Duration
+
+	// The longest a text waits for its turn in the chat's line. Its confirm
+	// is answered within the 30 s its HTTP caller waits, with room left for
+	// the send itself.
+	MaxTextWait time.Duration
 
 	// Rolling-window ceilings across all chats.
 	MaxPerHour int
@@ -74,6 +79,7 @@ func defaultSendLimits() sendLimits {
 	return sendLimits{
 		MinGapSameChat:    5 * time.Second,
 		MaxWaitSameChat:   15 * time.Second,
+		MaxTextWait:       10 * time.Second,
 		MaxPerHour:        40,
 		MaxPerDay:         200,
 		MaxNewChatsPerDay: 5,
@@ -96,12 +102,15 @@ type sendDecision struct {
 	RetryAfter time.Duration
 	// Limit names the limit that refused (refusedSpacing, ...).
 	Limit string
-	// SendAt is the turn an allowed send was given in its chat's line: now,
-	// or later when earlier sends to the same chat hold the turns before it
-	// (MinGapSameChat apart, at most MaxWaitSameChat ahead). It decides what
-	// the line can still take; the moment the send actually goes out is
-	// booked by ClaimSend once the send is ready.
+	// SendAt is the turn an upload was given in its chat's upload line
+	// (AuthorizeUpload): now, or later when earlier uploads hold the turns
+	// before it (MinGapSameChat apart, at most MaxWaitSameChat ahead). It
+	// only decides what the line can still take; when the send actually goes
+	// out is up to ClaimSend once the upload is done. A text gets now.
 	SendAt time.Time
+	// countedAt is the entry this send added to the volume counts, for
+	// Refund.
+	countedAt time.Time
 }
 
 // evaluateSend is the entire policy as a pure function: no clock, no mutex, no
@@ -176,12 +185,12 @@ func evaluateSend(
 type sendGovernor struct {
 	mu     sync.Mutex
 	limits sendLimits
-	// nextTurn: the next turn Authorize can hand out in a chat's line.
+	// nextTurn: the next turn AuthorizeUpload can hand out in a chat's
+	// upload line.
 	nextTurn map[string]time.Time
-	// nextSlot: the earliest moment ClaimSend can book for the next send that
-	// actually goes out to a chat.
-	nextSlot map[string]time.Time
-	sent     []time.Time // every authorized send, trimmed to 24h
+	// lines: each chat's line of sends about to go out (ClaimSend).
+	lines map[string]*chatLine
+	sent  []time.Time // every authorized send, trimmed to 24h
 	// newChats: chats that opened a conversation, by when they first did,
 	// trimmed to 24h. A map so a chat counts once however often it is written.
 	newChats map[string]time.Time
@@ -191,26 +200,47 @@ func newSendGovernor(limits sendLimits) *sendGovernor {
 	return &sendGovernor{
 		limits:   limits,
 		nextTurn: make(map[string]time.Time),
-		nextSlot: make(map[string]time.Time),
+		lines:    make(map[string]*chatLine),
 		newChats: make(map[string]time.Time),
 	}
 }
 
-// Authorize decides, and on approval immediately records the send and
-// reserves its turn in the chat.
+// Authorize decides a send that goes out as soon as it is allowed — a text,
+// a reply, a reaction — and on approval records it. Its moment in the chat
+// comes from ClaimSend, right after.
 //
-// Recording before the network call rather than after is deliberate. If the
-// send then fails, a slot is consumed that produced no message — but the
-// alternative leaks: two concurrent requests would both read a count of zero,
-// both pass, and both send. Spending a slot on a failure is the cheap error.
+// Recording before the network call rather than after is deliberate: two
+// concurrent requests would otherwise both read a count of zero, both pass,
+// and both send. A send that then sends nothing, with its draft still
+// usable, gives the count back (Refund); one that fails after leaving may
+// have reached WhatsApp, and stays counted.
 func (g *sendGovernor) Authorize(chat string, isNewChat bool, now time.Time) sendDecision {
+	return g.authorize(chat, isNewChat, now, false)
+}
+
+// AuthorizeUpload decides a send that goes out only once its file is
+// uploaded, and also gives it a turn in the chat's upload line: uploads still
+// running count against MaxWaitSameChat, so a loop cannot start a hundred
+// uploads to one chat. Texts take no such turn: a text confirmed while
+// uploads to the same chat are still running goes out as soon as the line of
+// sends actually going out lets it, instead of sitting out turns nobody is
+// using (2026-10-21 review).
+func (g *sendGovernor) AuthorizeUpload(chat string, isNewChat bool, now time.Time) sendDecision {
+	return g.authorize(chat, isNewChat, now, true)
+}
+
+func (g *sendGovernor) authorize(chat string, isNewChat bool, now time.Time, upload bool) sendDecision {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	g.trim(now)
 
+	var turn time.Time
+	if upload {
+		turn = g.nextTurn[chat]
+	}
 	_, counted := g.newChats[chat]
-	d := evaluateSend(g.limits, now, g.nextTurn[chat],
+	d := evaluateSend(g.limits, now, turn,
 		len(withinWindow(g.sent, now, time.Hour)), len(g.sent), len(g.newChats), isNewChat, counted)
 	if !d.Allow {
 		// Say exactly when it frees up: the windows roll, so "today" is not
@@ -233,79 +263,158 @@ func (g *sendGovernor) Authorize(chat string, isNewChat bool, now time.Time) sen
 		return d
 	}
 
-	g.nextTurn[chat] = d.SendAt.Add(g.limits.MinGapSameChat)
+	if upload {
+		g.nextTurn[chat] = d.SendAt.Add(g.limits.MinGapSameChat)
+	}
 	g.sent = append(g.sent, now)
+	d.countedAt = now
 	if isNewChat && !counted {
 		g.newChats[chat] = now
 	}
 	return d
 }
 
-// ClaimSend books the moment a send to chat goes out, and waits for it.
-//
-// Moments are booked under the lock, MinGapSameChat apart, in the order sends
-// ask for them, and a send asks when it is ready to go: a text when it is
-// confirmed, a file when its upload finishes. So sends to one chat go out in
-// the order they became ready, each at least MinGapSameChat after the one
-// before, and each knows its moment the instant it asks. Until 2026-10-21 a
-// text first sat out the turns of uploads that had not sent anything yet,
-// then polled against them, and whichever waiter woke first went: a text
-// could lose that race to every upload finishing around it.
-//
-// A send whose moment would be more than maxWait away books nothing and gets
-// a *sendQueueFull; a negative maxWait waits as long as ctx allows. A booking
-// abandoned because ctx ended is not given back: it leaves one extra gap in
-// the chat, which is the cheap error.
-func (g *sendGovernor) ClaimSend(ctx context.Context, chat string, maxWait time.Duration) error {
-	if err := ctx.Err(); err != nil {
-		return err
+// Refund gives back the volume an approved send counted, for a send that
+// ended without anything going out and left its draft usable — otherwise
+// every retry the answer invites would count again (2026-10-21 review). A new
+// conversation stays counted: the chat was approved as one, and retrying does
+// not count it twice.
+func (g *sendGovernor) Refund(d sendDecision) {
+	if !d.Allow || d.countedAt.IsZero() {
+		return
 	}
-	at, err := g.book(chat, time.Now(), maxWait)
-	if err != nil {
-		return err
-	}
-	wait := time.Until(at)
-	if wait <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-// book is ClaimSend's decision, without the waiting.
-func (g *sendGovernor) book(chat string, now time.Time, maxWait time.Duration) (time.Time, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	at := now
-	if next := g.nextSlot[chat]; next.After(at) {
-		at = next
+	for i := len(g.sent) - 1; i >= 0; i-- {
+		if g.sent[i].Equal(d.countedAt) {
+			g.sent = append(g.sent[:i], g.sent[i+1:]...)
+			return
+		}
 	}
-	if wait := at.Sub(now); maxWait >= 0 && wait > maxWait {
-		return time.Time{}, &sendQueueFull{Wait: wait, MaxWait: maxWait, Gap: g.limits.MinGapSameChat}
-	}
-	g.nextSlot[chat] = at.Add(g.limits.MinGapSameChat)
-	return at, nil
 }
 
-// sendQueueFull is ClaimSend refusing a send whose moment is further away
-// than it may wait. Nothing was booked for it.
+// chatLine is one chat's line of sends about to go out: one at a time, in
+// the order they asked, each MinGapSameChat after the previous one went out.
+type chatLine struct {
+	// baton holds one token, and the send holding it is the one that may go
+	// out. A channel because goroutines blocked receiving from it are served
+	// in the order they arrived — the line's order — and because a wait on
+	// it can be abandoned (select) without costing anyone else their place.
+	baton chan struct{}
+	// lastSent is when the previous send to the chat went out. Only the
+	// baton's holder reads or writes it.
+	lastSent time.Time
+	// queued counts the sends holding or waiting for the baton; under g.mu.
+	queued int
+}
+
+// ClaimSend waits for chat's line: until every send that asked before has
+// gone out or given up, and MinGapSameChat has passed since the last one
+// went out. A send asks when it is ready: a text when it is confirmed, a file
+// when its upload has finished. The caller must then call release exactly
+// once — with the moment its message went out (just before the network
+// call), or the zero Time if it sent nothing — and the next send in line
+// takes its gap from that moment.
+//
+// Until 2026-10-21 the gap was kept between booked moments instead: a slow
+// database write or a slow send shrank the real gap to the next message, and
+// a stall could even send two messages in the wrong order.
+//
+// maxWait bounds the whole wait (a negative maxWait waits as long as ctx
+// allows): a send that cannot get its turn in time gives up its place and
+// gets a *sendQueueFull. One that could not make it even if every send ahead
+// went out back to back is refused at once rather than after waiting.
+func (g *sendGovernor) ClaimSend(ctx context.Context, chat string, maxWait time.Duration) (release func(sentAt time.Time), err error) {
+	start := time.Now()
+	gap := g.limits.MinGapSameChat
+	g.mu.Lock()
+	line := g.lines[chat]
+	if line == nil {
+		line = &chatLine{baton: make(chan struct{}, 1)}
+		line.baton <- struct{}{}
+		g.lines[chat] = line
+	}
+	ahead := line.queued
+	full := &sendQueueFull{Ahead: ahead, MaxWait: maxWait, Gap: gap}
+	if maxWait >= 0 && time.Duration(ahead)*gap > maxWait {
+		g.mu.Unlock()
+		return nil, full
+	}
+	line.queued++
+	g.mu.Unlock()
+
+	leave := func() {
+		g.mu.Lock()
+		line.queued--
+		g.mu.Unlock()
+	}
+	giveBack := func() {
+		line.baton <- struct{}{}
+		leave()
+	}
+
+	var deadline <-chan time.Time
+	if maxWait >= 0 {
+		timer := time.NewTimer(maxWait)
+		defer timer.Stop()
+		deadline = timer.C
+	}
+	select {
+	case <-line.baton:
+	case <-ctx.Done():
+		leave()
+		return nil, ctx.Err()
+	case <-deadline:
+		leave()
+		return nil, full
+	}
+
+	if wait := time.Until(line.lastSent.Add(gap)); wait > 0 {
+		if maxWait >= 0 && time.Since(start)+wait > maxWait {
+			giveBack()
+			return nil, full
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			giveBack()
+			return nil, ctx.Err()
+		}
+	}
+
+	var once sync.Once
+	return func(sentAt time.Time) {
+		once.Do(func() {
+			if !sentAt.IsZero() {
+				line.lastSent = sentAt
+			}
+			giveBack()
+		})
+	}, nil
+}
+
+// sendQueueFull is ClaimSend refusing a send that would wait longer than it
+// may. It holds no place in the line.
 type sendQueueFull struct {
-	Wait, MaxWait, Gap time.Duration
+	Ahead        int
+	MaxWait, Gap time.Duration
 }
 
 func (e *sendQueueFull) Error() string {
-	return fmt.Sprintf("this chat already has messages going out over the next %s: sends to one chat go out %s apart, "+
-		"and a message does not wait more than %s for its turn", e.Wait.Round(time.Second), e.Gap, e.MaxWait)
+	return fmt.Sprintf("%d message(s) to this chat are ahead of this one: sends to one chat go out one at a time, %s apart, "+
+		"and a message does not wait more than %s for its turn", e.Ahead, e.Gap, e.MaxWait)
 }
 
-// RetryAfter is how much later the send would fit.
-func (e *sendQueueFull) RetryAfter() time.Duration { return e.Wait - e.MaxWait }
+// RetryAfter estimates when the send would fit: once the sends ahead have
+// gone out back to back, and at least one gap from now.
+func (e *sendQueueFull) RetryAfter() time.Duration {
+	if d := time.Duration(e.Ahead)*e.Gap - e.MaxWait; d > e.Gap {
+		return d
+	}
+	return e.Gap
+}
 
 func (g *sendGovernor) oldestNewChat() time.Time {
 	var oldest time.Time
@@ -359,9 +468,11 @@ func (g *sendGovernor) trim(now time.Time) {
 			delete(g.nextTurn, chat)
 		}
 	}
-	for chat, t := range g.nextSlot {
-		if !t.After(now) {
-			delete(g.nextSlot, chat)
+	for chat, line := range g.lines {
+		// Nobody holds or waits for its baton, so its last writer is done
+		// with lastSent (it decremented queued under g.mu afterwards).
+		if line.queued == 0 && now.Sub(line.lastSent) > g.limits.MinGapSameChat {
+			delete(g.lines, chat)
 		}
 	}
 }

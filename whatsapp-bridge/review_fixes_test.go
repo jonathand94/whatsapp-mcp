@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
@@ -91,35 +92,36 @@ func TestConfirmThatLostTheRaceAnswersWithTheDelivery(t *testing.T) {
 	s, _ := newMediaTestServer(t)
 	seedDraft(t, s, "raced-1", "sent", time.Now().Unix(), "")
 
-	code, body := s.commitSend(t.Context(), "raced-1", types.JID{}, "5215555555555@s.whatsapp.net", "Juan", "", nil, "chat-a", -1)
+	g := s.sendGov()
+	ticket := &sendTicket{gov: g, decision: g.Authorize("chat-a", false, time.Now())}
+	release, err := g.ClaimSend(t.Context(), "chat-a", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.release = release
+	code, body := s.commitSend(t.Context(), "raced-1", types.JID{}, "5215555555555@s.whatsapp.net", "Juan", "", nil, ticket)
 	got, ok := body.(confirmResponse)
 	if code != http.StatusOK || !ok || got.WhatsAppMessageID != "3EB0SENT" {
 		t.Fatalf("got %d %+v, want the first confirm's delivery", code, body)
 	}
+	// It sent nothing: its turn passed on and its count was given back.
+	if n := lineLength(g, "chat-a"); n != 0 {
+		t.Fatalf("the losing confirm still holds the line (%d)", n)
+	}
+	if sent := g.Snapshot(time.Now())["sent_last_hour"].(int); sent != 0 {
+		t.Fatalf("the losing confirm is still counted: %d", sent)
+	}
 }
 
-// TestTextHeldBackByALongLineSaysWhenToRetry: a text waits for its moment
-// only as long as the line may be (MaxWaitSameChat); past that it is refused
-// with the wait in the details — the only part the MCP layer passes on — and
-// the draft stays usable.
+// TestTextHeldBackByALongLineSaysWhenToRetry: a text refused by the chat's
+// line says when to confirm again in the details, the only part the MCP
+// layer passes on.
 func TestTextHeldBackByALongLineSaysWhenToRetry(t *testing.T) {
-	s, _ := newMediaTestServer(t)
-	seedDraft(t, s, "text-1", "draft", time.Now().Unix(), "")
-	g := s.sendGov()
-	for i := 0; i < 4; i++ { // four sends already going out: next moment +20 s
-		g.book("chat-b", time.Now(), -1)
-	}
-
-	code, body := s.commitSend(t.Context(), "text-1", types.JID{}, "5215555555555@s.whatsapp.net", "Juan", "", nil,
-		"chat-b", g.limits.MaxWaitSameChat)
-	e, ok := body.(errorResponse)
-	if code != http.StatusTooManyRequests || !ok || !strings.HasSuffix(e.Details, "confirm it again in 5s.") {
-		t.Fatalf("got %d %+v", code, body)
-	}
-	var status string
-	s.db.QueryRow(`SELECT status FROM sends WHERE draft_id = 'text-1'`).Scan(&status)
-	if status != "draft" {
-		t.Fatalf("draft is %q after being held back, want it still a draft", status)
+	full := &sendQueueFull{Ahead: 3, MaxWait: 10 * time.Second, Gap: 5 * time.Second}
+	got := rateLimited(full.Error(), full.RetryAfter(), 50*time.Minute)
+	if !strings.HasPrefix(got.Details, "3 message(s) to this chat are ahead of this one") ||
+		!strings.HasSuffix(got.Details, "; confirm it again in 5s.") || got.RetryAfterMS != 5000 {
+		t.Fatalf("got %+v", got)
 	}
 }
 
@@ -369,23 +371,61 @@ func TestChatSortTimeClampsTheFuture(t *testing.T) {
 // path keeps out of previews stay out here too.
 func TestHistoryLeavesFutureDatesOutOfTheChatList(t *testing.T) {
 	now := time.Unix(1792557000, 0)
-	hs := func(ts int64, m *waE2E.Message) *waHistorySync.HistorySyncMsg {
+	hsID := func(id string, ts int64, m *waE2E.Message) *waHistorySync.HistorySyncMsg {
 		return &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{
+			Key:              &waCommon.MessageKey{ID: proto.String(id)},
 			MessageTimestamp: proto.Uint64(uint64(ts)), Message: m}}
 	}
+	hs := func(ts int64, m *waE2E.Message) *waHistorySync.HistorySyncMsg { return hsID("", ts, m) }
 	msgs := []*waHistorySync.HistorySyncMsg{
-		hs(1784309593, &waE2E.Message{Conversation: proto.String("hola")}),
+		hsID("H-OK", 1784309593, &waE2E.Message{Conversation: proto.String("hola")}),
 		hs(2359569747, &waE2E.Message{Conversation: proto.String("del 2044")}),
 		hs(1784309700, &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
 			Type: waE2E.ProtocolMessage_REVOKE.Enum()}}),
 		{},
 	}
-	ts, preview := newestForChatList(msgs, now)
-	if ts != 1784309593 || preview != "hola" {
-		t.Fatalf("got (%d, %q), want the newest believable, visible message", ts, preview)
+	ts, id, preview := newestForChatList(msgs, now)
+	if ts != 1784309593 || id != "H-OK" || preview != "hola" {
+		t.Fatalf("got (%d, %q, %q), want the newest believable, visible message", ts, id, preview)
 	}
-	if ts, _ := newestForChatList(msgs[1:2], now); ts != 0 {
+	if ts, _, _ := newestForChatList(msgs[1:2], now); ts != 0 {
 		t.Fatalf("a chunk with only a future message sorted its chat at %d", ts)
+	}
+}
+
+// TestHistoryMovesTimeIdAndPreviewTogether: history that brings a newer
+// message moves the chat's time, id and preview together; older history, or
+// a chunk with nothing to show, leaves a live chat's values alone.
+func TestHistoryMovesTimeIdAndPreviewTogether(t *testing.T) {
+	_, db := newMediaTestServer(t)
+	b := &Bridge{db: db}
+	const chat = "5215550000001@s.whatsapp.net"
+	read := func() (ts int64, id, preview string) {
+		db.QueryRow(`SELECT COALESCE(last_message_time, 0), COALESCE(last_message_id, ''), COALESCE(last_message_preview, '')
+			FROM chats WHERE jid = ?`, chat).Scan(&ts, &id, &preview)
+		return
+	}
+	steps := []struct {
+		ts          int64
+		id, preview string
+		wantID      string
+	}{
+		{1000, "A", "primero", "A"},    // new chat
+		{2000, "B", "segundo", "B"},    // newer history moves everything
+		{1500, "C", "intermedio", "B"}, // older history moves nothing
+		{0, "", "", "B"},               // nothing to show
+	}
+	for _, st := range steps {
+		if err := b.upsertHistoryChat(chat, "Ana", st.ts, st.id, st.preview); err != nil {
+			t.Fatal(err)
+		}
+		_, id, preview := read()
+		if id != st.wantID || (st.wantID == "B" && preview != "segundo") {
+			t.Fatalf("after history at %d: id %q preview %q, want %s", st.ts, id, preview, st.wantID)
+		}
+	}
+	if ts, _, _ := read(); ts != 2000 {
+		t.Fatalf("time = %d, want 2000", ts)
 	}
 }
 
@@ -400,8 +440,9 @@ func TestMigration008RepairsChatsFromTheFuture(t *testing.T) {
 		INSERT INTO messages (id, chat_jid, sender_jid, timestamp, type, content_text, is_from_me) VALUES
 		  ('OK1', ?, '', 1784309593, 'image', 'Foto del recibo', 1),
 		  ('BLANK', ?, '', 1784309600, 'system', '', 0),
+		  ('REVOKE', ?, '', 1784309650, 'system', '[unsupported: protocolMessage]', 0),
 		  ('BOGUS', ?, '', 2359569747, 'image', '', 1),
-		  ('BOGUS2', ?, '', 2359569747, 'text', 'del futuro', 1)`, pedro, pedro, pedro, onlyFuture); err != nil {
+		  ('BOGUS2', ?, '', 2359569747, 'text', 'del futuro', 1)`, pedro, pedro, pedro, pedro, onlyFuture); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE chats SET last_message_time = 2359569747, last_message_id = 'BOGUS', last_message_preview = ''

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strings"
@@ -25,7 +26,7 @@ func TestSpacingQueuesThenStopsARunawayLoop(t *testing.T) {
 
 	queued := int(lim.MaxWaitSameChat/lim.MinGapSameChat) + 1 // 0 s, 5 s, 10 s, 15 s
 	for i := 0; i < queued; i++ {
-		d := g.Authorize(chat, false, now)
+		d := g.AuthorizeUpload(chat, false, now)
 		if !d.Allow {
 			t.Fatalf("send %d refused although it fits the queue: %s", i, d.Reason)
 		}
@@ -37,7 +38,7 @@ func TestSpacingQueuesThenStopsARunawayLoop(t *testing.T) {
 	// A loop retrying immediately gets nothing more through, no matter how
 	// many times it tries.
 	for i := 0; i < 50; i++ {
-		d := g.Authorize(chat, false, now.Add(time.Duration(i)*10*time.Millisecond))
+		d := g.AuthorizeUpload(chat, false, now.Add(time.Duration(i)*10*time.Millisecond))
 		if d.Allow {
 			t.Fatalf("attempt %d slipped through a full queue", i)
 		}
@@ -49,7 +50,7 @@ func TestSpacingQueuesThenStopsARunawayLoop(t *testing.T) {
 	// And once the queue has drained, the same chat works again at once: this
 	// throttles, it does not blacklist.
 	later := now.Add(time.Duration(queued) * lim.MinGapSameChat)
-	if d := g.Authorize(chat, false, later); !d.Allow || !d.SendAt.Equal(later) {
+	if d := g.AuthorizeUpload(chat, false, later); !d.Allow || !d.SendAt.Equal(later) {
 		t.Fatalf("refused or delayed after the queue drained: %+v", d)
 	}
 }
@@ -96,7 +97,7 @@ func TestRefusalCostsNothing(t *testing.T) {
 
 	queued := int(lim.MaxWaitSameChat/lim.MinGapSameChat) + 1
 	for i := 0; i < queued+100; i++ {
-		g.Authorize(chat, false, now) // the first few queue, the rest are refused
+		g.AuthorizeUpload(chat, false, now) // the first few queue, the rest are refused
 	}
 
 	snap := g.Snapshot(now)
@@ -149,7 +150,8 @@ func TestNewChatRefusalSaysWhenItFrees(t *testing.T) {
 }
 
 // TestClaimSendKeepsTheGapForLateSends: a media send goes out when its upload
-// finishes, possibly at the same moment as another upload to the same chat.
+// finishes, possibly at the same moment as other uploads to the same chat.
+// They go one at a time, the gap counted from each actual send.
 func TestClaimSendKeepsTheGapForLateSends(t *testing.T) {
 	lim := defaultSendLimits()
 	lim.MinGapSameChat = 200 * time.Millisecond
@@ -164,19 +166,22 @@ func TestClaimSendKeepsTheGapForLateSends(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := g.ClaimSend(t.Context(), chat, -1); err != nil {
+			release, err := g.ClaimSend(t.Context(), chat, -1)
+			if err != nil {
 				t.Error(err)
 				return
 			}
+			at := time.Now()
 			mu.Lock()
-			sent = append(sent, time.Now())
+			sent = append(sent, at)
 			mu.Unlock()
+			release(at)
 		}()
 	}
 	wg.Wait()
 	sort.Slice(sent, func(i, j int) bool { return sent[i].Before(sent[j]) })
 	for i := 1; i < len(sent); i++ {
-		if gap := sent[i].Sub(sent[i-1]); gap < lim.MinGapSameChat-10*time.Millisecond {
+		if gap := sent[i].Sub(sent[i-1]); gap < lim.MinGapSameChat {
 			t.Fatalf("sends %d and %d went out %s apart, gap is %s", i-1, i, gap, lim.MinGapSameChat)
 		}
 	}
@@ -185,57 +190,175 @@ func TestClaimSendKeepsTheGapForLateSends(t *testing.T) {
 	}
 }
 
-// TestSendsGoOutInTheOrderTheyAsk: moments are booked under the lock, so the
-// order is the order of asking, and a send that would wait too long books
-// nothing — it does not push the sends behind it further out.
-func TestSendsGoOutInTheOrderTheyAsk(t *testing.T) {
+// TestTheGapCountsFromTheActualSend: a send that went out late (a slow
+// database write, a slow WhatsApp) pushes the next one back; the gap is not
+// counted from when the late one was let through.
+func TestTheGapCountsFromTheActualSend(t *testing.T) {
 	lim := defaultSendLimits()
+	lim.MinGapSameChat = 150 * time.Millisecond
 	g := newSendGovernor(lim)
 	const chat = "5215550647337@s.whatsapp.net"
-	now := time.Now()
 
-	for i := 0; i < 3; i++ {
-		at, err := g.book(chat, now, -1)
-		if want := now.Add(time.Duration(i) * lim.MinGapSameChat); err != nil || !at.Equal(want) {
-			t.Fatalf("booking %d: at +%s (%v), want +%s", i, at.Sub(now), err, want.Sub(now))
+	first, err := g.ClaimSend(t.Context(), chat, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := make(chan time.Time, 1)
+	go func() {
+		release, err := g.ClaimSend(t.Context(), chat, -1)
+		if err != nil {
+			t.Error(err)
+			close(next)
+			return
 		}
-	}
-	// The next moment is 15 s out: a send allowed to wait 10 s is refused,
-	// told it is 5 s short, and books nothing.
-	_, err := g.book(chat, now, 10*time.Second)
-	var full *sendQueueFull
-	if !errors.As(err, &full) || full.RetryAfter() != 5*time.Second {
-		t.Fatalf("want a refusal 5 s short, got %v", err)
-	}
-	if at, _ := g.book(chat, now, -1); !at.Equal(now.Add(3 * lim.MinGapSameChat)) {
-		t.Fatalf("the refused send still took a moment: next booking at +%s", at.Sub(now))
+		next <- time.Now()
+		release(time.Time{})
+	}()
+	time.Sleep(100 * time.Millisecond) // the first send is slow to leave
+	wentOut := time.Now()
+	first(wentOut)
+	if got := (<-next).Sub(wentOut); got < lim.MinGapSameChat {
+		t.Fatalf("the next send went %s after the late one, gap is %s", got, lim.MinGapSameChat)
 	}
 }
 
+// lineLength is how many sends hold or wait for chat's turn.
+func lineLength(g *sendGovernor, chat string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if line := g.lines[chat]; line != nil {
+		return line.queued
+	}
+	return 0
+}
+
+// TestSendsGoOutInTheOrderTheyAsk: the line serves sends in the order they
+// asked, and one that gives up does not cost the others their places.
+func TestSendsGoOutInTheOrderTheyAsk(t *testing.T) {
+	lim := defaultSendLimits()
+	lim.MinGapSameChat = time.Millisecond
+	g := newSendGovernor(lim)
+	const chat = "5215550647337@s.whatsapp.net"
+
+	holder, err := g.ClaimSend(t.Context(), chat, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var order []string
+	var wg sync.WaitGroup
+	quitter, quit := context.WithCancel(t.Context())
+	for i, name := range []string{"b", "quitter", "c", "d"} {
+		ctx := t.Context()
+		if name == "quitter" {
+			ctx = quitter
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			release, err := g.ClaimSend(ctx, chat, -1)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+			release(time.Time{})
+		}()
+		for lineLength(g, chat) != i+2 { // until it has its place
+			time.Sleep(time.Millisecond)
+		}
+	}
+	quit()
+	for lineLength(g, chat) != 4 {
+		time.Sleep(time.Millisecond)
+	}
+	holder(time.Now())
+	wg.Wait()
+	if got := strings.Join(order, ","); got != "b,c,d" {
+		t.Fatalf("served %s, want b,c,d", got)
+	}
+}
+
+// TestATextDoesNotWaitPastItsBudget: a text whose turn is further away than
+// MaxTextWait is refused — at once when even back-to-back sends ahead of it
+// would take too long — with an estimate of when it would fit, and it takes
+// no place in the line.
+func TestATextDoesNotWaitPastItsBudget(t *testing.T) {
+	lim := defaultSendLimits() // 5 s apart, texts wait up to 10 s
+	g := newSendGovernor(lim)
+	const chat = "5215550647337@s.whatsapp.net"
+
+	holder, _ := g.ClaimSend(t.Context(), chat, -1)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if release, err := g.ClaimSend(t.Context(), chat, -1); err == nil {
+				release(time.Time{})
+			}
+		}()
+	}
+	for lineLength(g, chat) != 3 {
+		time.Sleep(time.Millisecond)
+	}
+
+	start := time.Now()
+	_, err := g.ClaimSend(t.Context(), chat, lim.MaxTextWait)
+	var full *sendQueueFull
+	if !errors.As(err, &full) || time.Since(start) > time.Second {
+		t.Fatalf("want an immediate refusal, got %v after %s", err, time.Since(start))
+	}
+	if full.Ahead != 3 || full.RetryAfter() != 5*time.Second || lineLength(g, chat) != 3 {
+		t.Fatalf("refusal %+v, retry after %s, line %d; want 3 ahead, 5s, line unchanged",
+			full, full.RetryAfter(), lineLength(g, chat))
+	}
+	holder(time.Time{})
+	wg.Wait()
+}
+
 // TestATextIsNotHeldBehindUploadsStillRunning is the 2026-10-21 review case:
-// files confirmed first hold the first turns in the chat's line, but send
-// nothing until their uploads finish. A text confirmed after them goes out at
-// once instead of sitting out turns nobody is using, and the files still go
-// out spaced when their uploads finish together.
+// files confirmed first take turns in the chat's upload line, but send
+// nothing until their uploads finish. A text confirmed after them is allowed
+// and goes out at once instead of sitting out turns nobody is using.
 func TestATextIsNotHeldBehindUploadsStillRunning(t *testing.T) {
 	lim := defaultSendLimits()
 	g := newSendGovernor(lim)
 	const chat = "5215550647337@s.whatsapp.net"
 	now := time.Now()
 
-	for i := 0; i < 4; i++ { // three files, then the text
-		if d := g.Authorize(chat, false, now); !d.Allow {
-			t.Fatalf("confirm %d refused: %s", i, d.Reason)
+	for i := 0; i < 4; i++ {
+		if d := g.AuthorizeUpload(chat, false, now); !d.Allow {
+			t.Fatalf("file %d refused: %s", i, d.Reason)
 		}
 	}
-	if at, err := g.book(chat, now, lim.MaxWaitSameChat); err != nil || !at.Equal(now) {
-		t.Fatalf("text booked at +%s (%v), want now", at.Sub(now), err)
+	if d := g.AuthorizeUpload(chat, false, now); d.Allow {
+		t.Fatal("a fifth upload at once should be a burst")
 	}
-	for i := 1; i <= 3; i++ {
-		at, err := g.book(chat, now.Add(time.Second), -1)
-		if want := now.Add(time.Duration(i) * lim.MinGapSameChat); err != nil || !at.Equal(want) {
-			t.Fatalf("file %d at +%s (%v), want +%s", i, at.Sub(now), err, want.Sub(now))
-		}
+	if d := g.Authorize(chat, false, now); !d.Allow {
+		t.Fatalf("text refused behind uploads that have sent nothing: %s", d.Reason)
+	}
+	start := time.Now()
+	release, err := g.ClaimSend(t.Context(), chat, lim.MaxTextWait)
+	if err != nil || time.Since(start) > 100*time.Millisecond {
+		t.Fatalf("text waited %s (%v), want none", time.Since(start), err)
+	}
+	release(time.Now())
+}
+
+// TestRefundGivesTheVolumeBack: a send that ends without anything going out
+// gives its count back, so retries invited by a refusal do not add up; a new
+// conversation stays counted.
+func TestRefundGivesTheVolumeBack(t *testing.T) {
+	g := newSendGovernor(defaultSendLimits())
+	now := time.Now()
+	ticket := &sendTicket{gov: g, decision: g.Authorize("5215550000001@s.whatsapp.net", true, now)}
+	ticket.abandon()
+	ticket.abandon() // settling twice changes nothing
+	snap := g.Snapshot(now)
+	if snap["sent_last_hour"].(int) != 0 || snap["new_chats_today"].(int) != 1 {
+		t.Fatalf("after a refund: %v", snap)
 	}
 }
 
@@ -334,13 +457,18 @@ func TestStateStaysBounded(t *testing.T) {
 	for i := 0; i < 60*24*365; i += 37 {
 		g.Authorize(newJID(i%500), false, base.Add(time.Duration(i)*time.Minute))
 	}
+	for i := 0; i < 20; i++ {
+		if release, err := g.ClaimSend(t.Context(), newJID(i), -1); err == nil {
+			release(time.Now())
+		}
+	}
 	end := base.Add(time.Duration(60*24*365) * time.Minute)
 	g.Snapshot(end)
 
 	if n := len(g.sent); n > 24*60 {
 		t.Fatalf("send history holds %d entries after a year; the 24h window is not trimming", n)
 	}
-	if n := len(g.nextTurn) + len(g.nextSlot); n > 2 {
+	if n := len(g.nextTurn) + len(g.lines); n > 2 {
 		t.Fatalf("per-chat maps hold %d entries; entries past the spacing window are not being dropped", n)
 	}
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -479,13 +480,13 @@ def _to_unix(value: str, end_of_day: bool) -> int:
     from datetime import datetime, timedelta
 
     text = str(value).strip()
-    if text.replace(".", "", 1).isdigit():
+    if re.fullmatch(r"\d{1,19}(\.\d+)?", text, re.ASCII):
         seconds = float(text)
-        # Milliseconds, the unit of JavaScript's Date.now() and of WhatsApp's
-        # own *_ms fields. Read as seconds they are a date tens of thousands
+        # Milliseconds (JavaScript's Date.now(), WhatsApp's own *_ms fields),
+        # or micro- or nanoseconds. Read as seconds they are a date thousands
         # of years out, and the filter silently matches nothing; no date in
         # seconds reaches 1e11 before the year 5138.
-        if seconds >= 1e11:
+        while seconds >= 1e11:
             seconds /= 1000
         return int(seconds)
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):

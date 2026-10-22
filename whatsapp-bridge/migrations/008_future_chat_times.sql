@@ -5,9 +5,10 @@
 -- this deployment), and its preview and last_message_id pointed at that
 -- message. New writes no longer let such a time sort a chat (chat_time.go);
 -- this repairs the rows already written from the newest message in the chat
--- that is not from the future and has something to show (blank system rows
--- are hidden from list_messages too). A chat with no such message gets no
--- time, which sorts it last: its real time is unknown.
+-- that is not from the future and has something to show: blank system rows
+-- (hidden from list_messages too) and markers such as revokes and poll votes
+-- (kept out of previews on the live path) do not count. A chat with no such
+-- message gets no time, which sorts it last: its real time is unknown.
 --
 -- The messages themselves keep their timestamps: their real time is unknown.
 
@@ -20,7 +21,8 @@ UPDATE chats
            FROM messages m
           WHERE m.chat_jid = chats.jid
             AND m.timestamp <= CAST(strftime('%s', 'now') AS INTEGER) + 86400
-            AND NOT (m.type = 'system' AND COALESCE(m.content_text, '') = '')
+            AND NOT (m.type = 'system' AND (COALESCE(m.content_text, '') = ''
+                                            OR m.content_text LIKE '[unsupported: %'))
           ORDER BY m.timestamp DESC
           LIMIT 1)
  WHERE last_message_time > CAST(strftime('%s', 'now') AS INTEGER) + 86400;

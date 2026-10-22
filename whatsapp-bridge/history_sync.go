@@ -98,25 +98,11 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			continue
 		}
 
-		// Newest message in this conversation, used to seed the chat row's
-		// sort key + preview without regressing a live chat's fresher values.
-		convMaxTS, convPreview := newestForChatList(msgs, time.Now())
-
 		// Ensure the chat row exists BEFORE inserting messages: messages.chat_jid
 		// has a FOREIGN KEY to chats(jid) and the message DB runs with foreign_keys
-		// ON, so a missing parent row would fail every insert. MAX() guards keep a
-		// live chat's newer last_message_time from being clobbered by history.
-		chatName := conv.GetName()
-		if _, err := b.db.Exec(`
-			INSERT INTO chats (jid, chat_type, name, normalized_name, last_message_time, last_message_preview, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(jid) DO UPDATE SET
-				name              = COALESCE(chats.name, excluded.name),
-				normalized_name   = COALESCE(chats.normalized_name, excluded.normalized_name),
-				last_message_time = MAX(COALESCE(chats.last_message_time, 0), excluded.last_message_time),
-				updated_at        = excluded.updated_at
-		`, chatJID, chatTypeFromJIDString(chatJID), nullIfEmpty(chatName), nullIfEmpty(Normalize(chatName)),
-			convMaxTS, nullIfEmpty(convPreview), convMaxTS, convMaxTS); err != nil {
+		// ON, so a missing parent row would fail every insert.
+		newestTS, newestID, newestPreview := newestForChatList(msgs, time.Now())
+		if err := b.upsertHistoryChat(chatJID, conv.GetName(), newestTS, newestID, newestPreview); err != nil {
 			log.Printf("history_sync: chat upsert %s failed: %v", chatJID, err)
 			continue
 		}
@@ -266,7 +252,7 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 // previews (hiddenFromChatPreview) and anything dated more than futureSlack
 // ahead, which in history is a bad timestamp rather than news (chat_time.go).
 // ts is 0 when no message qualifies.
-func newestForChatList(msgs []*waHistorySync.HistorySyncMsg, now time.Time) (ts int64, preview string) {
+func newestForChatList(msgs []*waHistorySync.HistorySyncMsg, now time.Time) (ts int64, id, preview string) {
 	for _, hsMsg := range msgs {
 		wm := hsMsg.GetMessage()
 		if wm == nil || hiddenFromChatPreview(wm.GetMessage()) {
@@ -276,11 +262,35 @@ func newestForChatList(msgs []*waHistorySync.HistorySyncMsg, now time.Time) (ts 
 		if !believableTime(t, now) || t < ts {
 			continue
 		}
-		ts = t
+		ts, id = t, wm.GetKey().GetID()
 		c, _ := extractContentFromProto(wm.GetMessage())
 		preview = truncate(c, 120)
 	}
-	return ts, preview
+	return ts, id, preview
+}
+
+// upsertHistoryChat creates a history chunk's chat row, or brings an existing
+// one forward to the chunk's newest message (ts, id, preview from
+// newestForChatList) when that is newer than what the row has. A live chat's
+// fresher values are never regressed, and the time, id and preview move
+// together: until 2026-10-21 only the time moved, leaving a preview from an
+// older message under it.
+func (b *Bridge) upsertHistoryChat(chatJID, name string, ts int64, id, preview string) error {
+	_, err := b.db.Exec(`
+		INSERT INTO chats (jid, chat_type, name, normalized_name, last_message_id, last_message_time, last_message_preview, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name                 = COALESCE(chats.name, excluded.name),
+			normalized_name      = COALESCE(chats.normalized_name, excluded.normalized_name),
+			last_message_id      = CASE WHEN excluded.last_message_time > COALESCE(chats.last_message_time, 0)
+			                            THEN excluded.last_message_id ELSE chats.last_message_id END,
+			last_message_preview = CASE WHEN excluded.last_message_time > COALESCE(chats.last_message_time, 0)
+			                            THEN excluded.last_message_preview ELSE chats.last_message_preview END,
+			last_message_time    = MAX(COALESCE(chats.last_message_time, 0), excluded.last_message_time),
+			updated_at           = excluded.updated_at
+	`, chatJID, chatTypeFromJIDString(chatJID), nullIfEmpty(name), nullIfEmpty(Normalize(name)),
+		nullIfEmpty(id), ts, nullIfEmpty(preview), ts, ts)
+	return err
 }
 
 // chatTypeFromJIDString parses a raw JID string and returns the chats.chat_type

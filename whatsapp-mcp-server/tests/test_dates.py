@@ -14,10 +14,12 @@ import pytest
 from main import _to_unix
 
 
-def test_seconds_and_milliseconds_are_the_same_moment():
+def test_every_unit_of_timestamp_is_the_same_moment():
     assert _to_unix("1792557000", end_of_day=False) == 1792557000
-    assert _to_unix("1792557000123", end_of_day=False) == 1792557000
     assert _to_unix("1792557000.9", end_of_day=False) == 1792557000
+    assert _to_unix("1792557000123", end_of_day=False) == 1792557000  # ms
+    assert _to_unix("1792557000123456", end_of_day=False) == 1792557000  # µs
+    assert _to_unix("1792557000123456789", end_of_day=False) == 1792557000  # ns
 
 
 def test_a_bare_date_as_upper_bound_is_the_whole_day():
@@ -31,7 +33,7 @@ def test_date_and_time():
     assert _to_unix("2026-10-21 14:30", end_of_day=True) == int(datetime(2026, 10, 21, 14, 30).timestamp())
 
 
-@pytest.mark.parametrize("bad", ["ayer", "21/10/2026", "1.2.3", "-5"])
+@pytest.mark.parametrize("bad", ["ayer", "21/10/2026", "1.2.3", "-5", "²", "1" * 400])
 def test_unrecognised_dates_say_what_works(bad):
     with pytest.raises(ValueError, match="segundos o milisegundos"):
         _to_unix(bad, end_of_day=False)
