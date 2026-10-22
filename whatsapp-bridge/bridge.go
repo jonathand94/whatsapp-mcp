@@ -703,9 +703,16 @@ func extractContentFromProto(raw *waE2E.Message) (text, msgType string) {
 		// to relabel a rare row. The marker is what every reader keys on
 		// (unsupportedRawType), and it is queryable:
 		//   SELECT * FROM messages WHERE content_text LIKE '[unsupported: %'
-		if raw := unsupportedMessageType(m); raw != "" {
-			log.Printf("extractContent: undecoded WhatsApp message type %q — stored with an explicit unsupported marker (no text captured; add a decoder if it carries user text)", raw)
-			return unsupportedMarker(raw), "system"
+		undecoded := unsupportedMessageType(m)
+		if undecoded == "" {
+			// The payload is empty, but a message further out in the
+			// envelope carries a field from a newer WhatsApp: that field may
+			// be the content (see envelopeUnknownFields).
+			undecoded = strings.Join(envelopeUnknownFields(raw), ",")
+		}
+		if undecoded != "" {
+			log.Printf("extractContent: undecoded WhatsApp message type %q — stored with an explicit unsupported marker (no text captured; add a decoder if it carries user text)", undecoded)
+			return unsupportedMarker(undecoded), "system"
 		}
 		return "", "system"
 	}
@@ -771,7 +778,7 @@ func isPlumbing(raw *waE2E.Message) bool {
 	if raw == nil {
 		return true
 	}
-	if hasUnreadableFields(raw.ProtoReflect()) {
+	if len(envelopeUnknownFields(raw)) > 0 {
 		return false
 	}
 	m := unwrapEnvelope(raw)
@@ -784,34 +791,6 @@ func isPlumbing(raw *waE2E.Message) bool {
 		return onlyCarriers
 	})
 	return onlyCarriers
-}
-
-// envelopeTypes are the message types an envelope is made of: the message
-// itself and the wrappers around it.
-var envelopeTypes = map[protoreflect.FullName]bool{
-	(&waE2E.Message{}).ProtoReflect().Descriptor().FullName():            true,
-	(&waE2E.FutureProofMessage{}).ProtoReflect().Descriptor().FullName(): true,
-	(&waE2E.DeviceSentMessage{}).ProtoReflect().Descriptor().FullName():  true,
-}
-
-// hasUnreadableFields reports whether m, or any message along its envelope,
-// carries fields this whatsmeow cannot parse (protobuf "unknown fields") —
-// that is, content from a newer WhatsApp. Only the envelope is examined:
-// unknown fields inside a known content message or a carrier belong to that
-// message, which is already classified by its known type.
-func hasUnreadableFields(m protoreflect.Message) bool {
-	if len(m.GetUnknown()) > 0 {
-		return true
-	}
-	found := false
-	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
-		if fd.Kind() == protoreflect.MessageKind && !fd.IsList() && !fd.IsMap() &&
-			envelopeTypes[fd.Message().FullName()] && hasUnreadableFields(v.Message()) {
-			found = true
-		}
-		return !found
-	})
-	return found
 }
 
 // unsupportedMessageType names the populated content field(s) of a message
@@ -839,22 +818,7 @@ func unsupportedMessageType(m proto.Message) string {
 	// Fields from a newer WhatsApp are not visited by Range at all. Named by
 	// number, so a message made only of them gets a marker instead of passing
 	// for an empty one.
-	seen := map[protowire.Number]bool{}
-	for unknown := r.GetUnknown(); len(unknown) > 0; {
-		num, typ, n := protowire.ConsumeTag(unknown)
-		if n < 0 {
-			break
-		}
-		unknown = unknown[n:]
-		if n = protowire.ConsumeFieldValue(num, typ, unknown); n < 0 {
-			break
-		}
-		unknown = unknown[n:]
-		if !seen[num] {
-			seen[num] = true
-			names = append(names, fmt.Sprintf("unknown_field_%d", num))
-		}
-	}
+	names = append(names, unknownFieldNames(r, map[protowire.Number]bool{})...)
 	if len(names) == 0 {
 		return ""
 	}

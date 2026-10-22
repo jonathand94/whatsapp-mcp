@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"go.mau.fi/whatsmeow/proto/waCommon"
@@ -309,6 +310,26 @@ func TestNewerWhatsAppContentIsKept(t *testing.T) {
 		t.Fatalf("want both stored with an unknown_field marker, got %d", markers)
 	}
 
+	// The same inside the other envelopes the decoder opens: a comment on a
+	// community announcement, and an edit (2026-10-21 review: both were
+	// still dropped). And a newer field on the outer message around a payload
+	// of carriers only is kept with a marker, not stored as a blank row.
+	comment := &waE2E.Message{CommentMessage: &waE2E.CommentMessage{Message: withUnknownField(&waE2E.Message{}, 997)}}
+	edit := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), EditedMessage: withUnknownField(&waE2E.Message{}, 996)}}
+	outer := withUnknownField(&waE2E.Message{EphemeralMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{
+		SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{}}}}, 995)
+	for id, m := range map[string]*waE2E.Message{"new-3": comment, "new-4": edit, "new-5": outer} {
+		if isPlumbing(m) || hiddenFromChatPreview(m) {
+			t.Fatalf("%s: newer content classified as plumbing or hidden from the preview", id)
+		}
+		b.handleEvent(&events.Message{Info: parityTestInfo(t, id, ts), Message: m})
+	}
+	db.QueryRow(`SELECT COUNT(*) FROM messages WHERE id IN ('new-3','new-4','new-5') AND content_text LIKE '[unsupported: unknown_field_%'`).Scan(&markers)
+	if markers != 3 {
+		t.Fatalf("want the comment, the edit and the outer field stored with a marker, got %d", markers)
+	}
+
 	// Plumbing whose metadata has fields newer than whatsmeow is still plumbing:
 	// only the envelope decides, not a carrier's insides.
 	ctx := &waE2E.MessageContextInfo{}
@@ -317,5 +338,38 @@ func TestNewerWhatsAppContentIsKept(t *testing.T) {
 	ctx.ProtoReflect().SetUnknown(raw)
 	if !isPlumbing(&waE2E.Message{MessageContextInfo: ctx, SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{}}) {
 		t.Fatal("new fields inside messageContextInfo made key distribution look like content")
+	}
+}
+
+// TestPlumbingIsWhatTheDecoderFindsEmpty pins the agreement the 2026-10-21
+// review found broken: a message is dropped as plumbing exactly when the
+// decoder has nothing to store for it — no text and no marker. Any other
+// combination either drops content or stores a blank row.
+func TestPlumbingIsWhatTheDecoderFindsEmpty(t *testing.T) {
+	skd := &waE2E.SenderKeyDistributionMessage{}
+	cases := map[string]*waE2E.Message{
+		"sender keys":           {SenderKeyDistributionMessage: skd},
+		"context only":          {MessageContextInfo: &waE2E.MessageContextInfo{}},
+		"empty":                 {},
+		"text":                  {Conversation: proto.String("hola")},
+		"keys in an ephemeral":  {EphemeralMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{SenderKeyDistributionMessage: skd}}},
+		"unknown at top":        withUnknownField(&waE2E.Message{}, 990),
+		"unknown in ephemeral":  {EphemeralMessage: &waE2E.FutureProofMessage{Message: withUnknownField(&waE2E.Message{}, 991)}},
+		"unknown in comment":    {CommentMessage: &waE2E.CommentMessage{Message: withUnknownField(&waE2E.Message{}, 992)}},
+		"unknown around keys":   withUnknownField(&waE2E.Message{EphemeralMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{SenderKeyDistributionMessage: skd}}}, 993),
+		"revoke":                {ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_REVOKE.Enum()}},
+		"keys beside real text": {SenderKeyDistributionMessage: skd, Conversation: proto.String("hola")},
+	}
+	for _, shape := range parityShapes() {
+		cases["parity "+shape.name] = shape.msg
+	}
+	for name, m := range cases {
+		text, typ := extractContentFromProto(m)
+		if empty := typ == "system" && text == ""; isPlumbing(m) != empty {
+			t.Errorf("%s: isPlumbing=%t but the decoder gives (%q, %q)", name, isPlumbing(m), typ, text)
+		}
+		if strings.Contains(text, "unknown_field_") && hiddenFromChatPreview(m) {
+			t.Errorf("%s: content from a newer WhatsApp is hidden from the chat preview", name)
+		}
 	}
 }

@@ -83,10 +83,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
@@ -100,109 +102,157 @@ const maxUnwrapDepth = 8
 // an envelope, so callers can apply it unconditionally.
 func unwrapEnvelope(m *waE2E.Message) *waE2E.Message {
 	for depth := 0; m != nil && depth < maxUnwrapDepth; depth++ {
-		var inner *waE2E.Message
-		switch {
-		case m.GetEphemeralMessage().GetMessage() != nil:
-			inner = m.GetEphemeralMessage().GetMessage()
-		case m.GetViewOnceMessage().GetMessage() != nil:
-			inner = m.GetViewOnceMessage().GetMessage()
-		case m.GetViewOnceMessageV2().GetMessage() != nil:
-			inner = m.GetViewOnceMessageV2().GetMessage()
-		case m.GetViewOnceMessageV2Extension().GetMessage() != nil:
-			inner = m.GetViewOnceMessageV2Extension().GetMessage()
-		case m.GetDocumentWithCaptionMessage().GetMessage() != nil:
-			inner = m.GetDocumentWithCaptionMessage().GetMessage()
-		case m.GetLottieStickerMessage().GetMessage() != nil:
-			inner = m.GetLottieStickerMessage().GetMessage()
-		case m.GetDeviceSentMessage().GetMessage() != nil:
-			inner = m.GetDeviceSentMessage().GetMessage()
-		case m.GetEditedMessage().GetMessage() != nil:
-			inner = m.GetEditedMessage().GetMessage()
-		// An edit delivered as a protocol message carries the replacement body,
-		// so the store ends up holding the edited text rather than a bare
-		// protocol row.
-		case m.GetProtocolMessage().GetEditedMessage() != nil:
-			inner = m.GetProtocolMessage().GetEditedMessage()
-
-		// Album children. Each photo or video of an album is sent as a message
-		// of its own inside this envelope, which is how the client knows to
-		// group it under the album's parent (albumMessage, decoded below). The
-		// child IS the media: unwrapped, it is stored as the image or video it
-		// is, and extractDownloadableFieldsFromProto — which unwraps first —
-		// reaches its media keys as well.
-		case m.GetAssociatedChildMessage().GetMessage() != nil:
-			inner = m.GetAssociatedChildMessage().GetMessage()
-		// The same parent/child arrangement for an event's cover image and for
-		// the picture on a poll option.
-		case m.GetEventCoverImage().GetMessage() != nil:
-			inner = m.GetEventCoverImage().GetMessage()
-		case m.GetPollCreationOptionImageMessage().GetMessage() != nil:
-			inner = m.GetPollCreationOptionImageMessage().GetMessage()
-
-		// Flags on an ordinary message: it mentions a group, invokes a bot, or
-		// hides behind a spoiler. They change how the client presents the
-		// message, not what it says. (whatsmeow strips botInvokeMessage itself
-		// on live events; history sync delivers it raw.)
-		case m.GetGroupMentionedMessage().GetMessage() != nil:
-			inner = m.GetGroupMentionedMessage().GetMessage()
-		case m.GetBotInvokeMessage().GetMessage() != nil:
-			inner = m.GetBotInvokeMessage().GetMessage()
-		case m.GetSpoilerMessage().GetMessage() != nil:
-			inner = m.GetSpoilerMessage().GetMessage()
-
-		// Status content delivered into a chat: a mention in someone's status,
-		// a status posted to a group, an "add yours" prompt. What is wrapped is
-		// the status itself.
-		case m.GetStatusMentionMessage().GetMessage() != nil:
-			inner = m.GetStatusMentionMessage().GetMessage()
-		case m.GetGroupStatusMentionMessage().GetMessage() != nil:
-			inner = m.GetGroupStatusMentionMessage().GetMessage()
-		case m.GetGroupStatusMessage().GetMessage() != nil:
-			inner = m.GetGroupStatusMessage().GetMessage()
-		case m.GetGroupStatusMessageV2().GetMessage() != nil:
-			inner = m.GetGroupStatusMessageV2().GetMessage()
-		case m.GetStatusAddYours().GetMessage() != nil:
-			inner = m.GetStatusAddYours().GetMessage()
-
-		// Poll V4 is the one poll version typed as an envelope rather than as a
-		// PollCreationMessage; whatever it carries goes on to the poll decoders
-		// below, or to a marker named after the inner type.
-		case m.GetPollCreationMessageV4().GetMessage() != nil:
-			inner = m.GetPollCreationMessageV4().GetMessage()
-
-		// Bot, channel-question, newsletter-admin and limit-sharing variants.
-		// Typed FutureProofMessage like every case above, so their payload is a
-		// complete message too.
-		case m.GetBotTaskMessage().GetMessage() != nil:
-			inner = m.GetBotTaskMessage().GetMessage()
-		case m.GetBotForwardedMessage().GetMessage() != nil:
-			inner = m.GetBotForwardedMessage().GetMessage()
-		case m.GetBotPlatformRegistrationSuccessMessage().GetMessage() != nil:
-			inner = m.GetBotPlatformRegistrationSuccessMessage().GetMessage()
-		case m.GetQuestionMessage().GetMessage() != nil:
-			inner = m.GetQuestionMessage().GetMessage()
-		case m.GetQuestionReplyMessage().GetMessage() != nil:
-			inner = m.GetQuestionReplyMessage().GetMessage()
-		case m.GetNewsletterAdminProfileMessage().GetMessage() != nil:
-			inner = m.GetNewsletterAdminProfileMessage().GetMessage()
-		case m.GetNewsletterAdminProfileStatusMessage().GetMessage() != nil:
-			inner = m.GetNewsletterAdminProfileStatusMessage().GetMessage()
-		case m.GetLimitSharingMessage().GetMessage() != nil:
-			inner = m.GetLimitSharingMessage().GetMessage()
-
-		// A comment on a community announcement: the comment as a complete
-		// message plus the key of the post it answers — the deviceSentMessage
-		// shape. The store has no column for that link (a quoted reply loses
-		// its quote the same way), so the comment is kept as what it says.
-		case m.GetCommentMessage().GetMessage() != nil:
-			inner = m.GetCommentMessage().GetMessage()
-		}
+		inner := unwrapOnce(m)
 		if inner == nil {
 			return m
 		}
 		m = inner
 	}
 	return m
+}
+
+// unwrapOnce is one step of unwrapEnvelope: the message m wraps, or nil when
+// m is not an envelope.
+func unwrapOnce(m *waE2E.Message) *waE2E.Message {
+	var inner *waE2E.Message
+	switch {
+	case m.GetEphemeralMessage().GetMessage() != nil:
+		inner = m.GetEphemeralMessage().GetMessage()
+	case m.GetViewOnceMessage().GetMessage() != nil:
+		inner = m.GetViewOnceMessage().GetMessage()
+	case m.GetViewOnceMessageV2().GetMessage() != nil:
+		inner = m.GetViewOnceMessageV2().GetMessage()
+	case m.GetViewOnceMessageV2Extension().GetMessage() != nil:
+		inner = m.GetViewOnceMessageV2Extension().GetMessage()
+	case m.GetDocumentWithCaptionMessage().GetMessage() != nil:
+		inner = m.GetDocumentWithCaptionMessage().GetMessage()
+	case m.GetLottieStickerMessage().GetMessage() != nil:
+		inner = m.GetLottieStickerMessage().GetMessage()
+	case m.GetDeviceSentMessage().GetMessage() != nil:
+		inner = m.GetDeviceSentMessage().GetMessage()
+	case m.GetEditedMessage().GetMessage() != nil:
+		inner = m.GetEditedMessage().GetMessage()
+	// An edit delivered as a protocol message carries the replacement body,
+	// so the store ends up holding the edited text rather than a bare
+	// protocol row.
+	case m.GetProtocolMessage().GetEditedMessage() != nil:
+		inner = m.GetProtocolMessage().GetEditedMessage()
+
+	// Album children. Each photo or video of an album is sent as a message
+	// of its own inside this envelope, which is how the client knows to
+	// group it under the album's parent (albumMessage, decoded below). The
+	// child IS the media: unwrapped, it is stored as the image or video it
+	// is, and extractDownloadableFieldsFromProto — which unwraps first —
+	// reaches its media keys as well.
+	case m.GetAssociatedChildMessage().GetMessage() != nil:
+		inner = m.GetAssociatedChildMessage().GetMessage()
+	// The same parent/child arrangement for an event's cover image and for
+	// the picture on a poll option.
+	case m.GetEventCoverImage().GetMessage() != nil:
+		inner = m.GetEventCoverImage().GetMessage()
+	case m.GetPollCreationOptionImageMessage().GetMessage() != nil:
+		inner = m.GetPollCreationOptionImageMessage().GetMessage()
+
+	// Flags on an ordinary message: it mentions a group, invokes a bot, or
+	// hides behind a spoiler. They change how the client presents the
+	// message, not what it says. (whatsmeow strips botInvokeMessage itself
+	// on live events; history sync delivers it raw.)
+	case m.GetGroupMentionedMessage().GetMessage() != nil:
+		inner = m.GetGroupMentionedMessage().GetMessage()
+	case m.GetBotInvokeMessage().GetMessage() != nil:
+		inner = m.GetBotInvokeMessage().GetMessage()
+	case m.GetSpoilerMessage().GetMessage() != nil:
+		inner = m.GetSpoilerMessage().GetMessage()
+
+	// Status content delivered into a chat: a mention in someone's status,
+	// a status posted to a group, an "add yours" prompt. What is wrapped is
+	// the status itself.
+	case m.GetStatusMentionMessage().GetMessage() != nil:
+		inner = m.GetStatusMentionMessage().GetMessage()
+	case m.GetGroupStatusMentionMessage().GetMessage() != nil:
+		inner = m.GetGroupStatusMentionMessage().GetMessage()
+	case m.GetGroupStatusMessage().GetMessage() != nil:
+		inner = m.GetGroupStatusMessage().GetMessage()
+	case m.GetGroupStatusMessageV2().GetMessage() != nil:
+		inner = m.GetGroupStatusMessageV2().GetMessage()
+	case m.GetStatusAddYours().GetMessage() != nil:
+		inner = m.GetStatusAddYours().GetMessage()
+
+	// Poll V4 is the one poll version typed as an envelope rather than as a
+	// PollCreationMessage; whatever it carries goes on to the poll decoders
+	// below, or to a marker named after the inner type.
+	case m.GetPollCreationMessageV4().GetMessage() != nil:
+		inner = m.GetPollCreationMessageV4().GetMessage()
+
+	// Bot, channel-question, newsletter-admin and limit-sharing variants.
+	// Typed FutureProofMessage like every case above, so their payload is a
+	// complete message too.
+	case m.GetBotTaskMessage().GetMessage() != nil:
+		inner = m.GetBotTaskMessage().GetMessage()
+	case m.GetBotForwardedMessage().GetMessage() != nil:
+		inner = m.GetBotForwardedMessage().GetMessage()
+	case m.GetBotPlatformRegistrationSuccessMessage().GetMessage() != nil:
+		inner = m.GetBotPlatformRegistrationSuccessMessage().GetMessage()
+	case m.GetQuestionMessage().GetMessage() != nil:
+		inner = m.GetQuestionMessage().GetMessage()
+	case m.GetQuestionReplyMessage().GetMessage() != nil:
+		inner = m.GetQuestionReplyMessage().GetMessage()
+	case m.GetNewsletterAdminProfileMessage().GetMessage() != nil:
+		inner = m.GetNewsletterAdminProfileMessage().GetMessage()
+	case m.GetNewsletterAdminProfileStatusMessage().GetMessage() != nil:
+		inner = m.GetNewsletterAdminProfileStatusMessage().GetMessage()
+	case m.GetLimitSharingMessage().GetMessage() != nil:
+		inner = m.GetLimitSharingMessage().GetMessage()
+
+	// A comment on a community announcement: the comment as a complete
+	// message plus the key of the post it answers — the deviceSentMessage
+	// shape. The store has no column for that link (a quoted reply loses
+	// its quote the same way), so the comment is kept as what it says.
+	case m.GetCommentMessage().GetMessage() != nil:
+		inner = m.GetCommentMessage().GetMessage()
+	}
+	return inner
+}
+
+// envelopeUnknownFields names the fields this whatsmeow cannot parse
+// (protobuf "unknown fields", "unknown_field_N") on m and on every message
+// unwrapEnvelope passes through on the way to the payload: content from a
+// newer WhatsApp. Only the messages themselves are examined, never the
+// wrappers between them or a known content message's insides: a field
+// WhatsApp adds to a wrapper or to an image is metadata about something
+// already classified, while a field it adds to a message is a new kind of
+// message. Walking the same path as unwrapEnvelope keeps isPlumbing, the
+// decoder and hiddenFromChatPreview from ever disagreeing about one.
+func envelopeUnknownFields(m *waE2E.Message) []string {
+	var names []string
+	seen := map[protowire.Number]bool{}
+	for depth := 0; m != nil && depth < maxUnwrapDepth; depth++ {
+		names = append(names, unknownFieldNames(m.ProtoReflect(), seen)...)
+		m = unwrapOnce(m)
+	}
+	return names
+}
+
+// unknownFieldNames names r's unknown fields by number, skipping numbers
+// already in seen.
+func unknownFieldNames(r protoreflect.Message, seen map[protowire.Number]bool) []string {
+	var names []string
+	for unknown := r.GetUnknown(); len(unknown) > 0; {
+		num, typ, n := protowire.ConsumeTag(unknown)
+		if n < 0 {
+			break
+		}
+		unknown = unknown[n:]
+		if n = protowire.ConsumeFieldValue(num, typ, unknown); n < 0 {
+			break
+		}
+		unknown = unknown[n:]
+		if !seen[num] {
+			seen[num] = true
+			names = append(names, fmt.Sprintf("unknown_field_%d", num))
+		}
+	}
+	return names
 }
 
 // decodeExtraContent handles content types the main switch does not, returning
@@ -610,13 +660,11 @@ func joinNonEmpty(sep string, vals ...string) string {
 //
 // A message carrying several fields is hidden only if EVERY populated field is
 // one of the above, so a carrier riding along with real content never hides it.
-// Fields newer than this whatsmeow version are not seen at all, here or by
-// unsupportedMessageType: a message made only of those is stored as an empty
-// row, and is hidden like one.
+// Fields newer than this whatsmeow version, anywhere along the envelope, mean
+// content from a newer WhatsApp: it is stored with an unknown_field_N marker
+// and stays visible (envelopeUnknownFields).
 func hiddenFromChatPreview(m *waE2E.Message) bool {
-	// Content from a newer WhatsApp gets a marker and stays visible (see
-	// isPlumbing and unsupportedMessageType in bridge.go).
-	if m != nil && hasUnreadableFields(m.ProtoReflect()) {
+	if len(envelopeUnknownFields(m)) > 0 {
 		return false
 	}
 	m = unwrapEnvelope(m)
