@@ -479,8 +479,15 @@ def _to_unix(value: str, end_of_day: bool) -> int:
     from datetime import datetime, timedelta
 
     text = str(value).strip()
-    if text.isdigit():
-        return int(text)
+    if text.replace(".", "", 1).isdigit():
+        seconds = float(text)
+        # Milliseconds, the unit of JavaScript's Date.now() and of WhatsApp's
+        # own *_ms fields. Read as seconds they are a date tens of thousands
+        # of years out, and the filter silently matches nothing; no date in
+        # seconds reaches 1e11 before the year 5138.
+        if seconds >= 1e11:
+            seconds /= 1000
+        return int(seconds)
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
         try:
             moment = datetime.strptime(text, fmt)
@@ -489,7 +496,9 @@ def _to_unix(value: str, end_of_day: bool) -> int:
         if fmt == "%Y-%m-%d" and end_of_day:
             moment += timedelta(days=1, seconds=-1)
         return int(moment.timestamp())
-    raise ValueError(f"fecha no reconocida: {value!r}; usa 2026-10-21, 2026-10-21 14:30 o un timestamp unix")
+    raise ValueError(
+        f"fecha no reconocida: {value!r}; usa 2026-10-21, 2026-10-21 14:30 o un timestamp unix (segundos o milisegundos)"
+    )
 
 
 @mcp.tool()
@@ -517,7 +526,8 @@ async def list_messages(
                     notes included), voice, document, sticker, or media (any
                     of those).
         since: Only messages from this moment on: a date ("2026-10-01"), a
-               date and time ("2026-10-01 14:30"), or a unix timestamp.
+               date and time ("2026-10-01 14:30"), or a unix timestamp in
+               seconds or milliseconds.
         until: Only messages up to this moment, same formats. A bare date
                includes that whole day.
         from_me: True for only the user's own messages, False for only the

@@ -61,45 +61,27 @@ func aliasKeys(ctx context.Context, db *sql.DB, jids []string) map[string]string
 	return keys
 }
 
-// mergeChatRows folds chats that are the same person into the first (most
-// recent) of them, which keeps its name and preview; unread counts add up,
-// and merged_jids lists every JID folded in. rows must be newest first.
-func mergeChatRows(ctx context.Context, db *sql.DB, rows []chatRow) []chatRow {
-	jids := make([]string, len(rows))
-	for i, c := range rows {
-		jids[i] = c.JID
-	}
-	keys := aliasKeys(ctx, db, jids)
-	index := map[string]int{}
-	var out []chatRow
-	for _, c := range rows {
-		key := keys[c.JID]
-		i, seen := index[key]
-		if !seen {
-			index[key] = len(out)
-			out = append(out, c)
-			continue
-		}
-		head := &out[i]
-		if len(head.MergedJIDs) == 0 {
-			head.MergedJIDs = []string{head.JID}
-		}
-		head.MergedJIDs = append(head.MergedJIDs, c.JID)
-		head.UnreadCount += c.UnreadCount
-		if head.Name == "" {
-			head.Name = c.Name
-		}
-	}
-	return out
-}
+// chatScanBatch is the most chat rows chatsPage reads per query; a first
+// page reads fewer (twice what it shows, at least 50).
+var chatScanBatch = 500
 
-// chatsPage reads chats newest first and merges aliases before paginating, so
-// offset and limit count people rather than rows. It reads enough rows to fill
-// the page after merging (a person is at most a handful of rows).
+// chatsPage reads chats newest first, one entry per person, and paginates by
+// person: offset and limit count people, not rows. A person is listed where
+// their most recent chat row falls, and their other rows (the same person's
+// phone JID or @lid) are folded into that entry wherever those rows are.
+//
+// It scans from the newest chat until the page is full, in batches: knowing
+// who was already listed on earlier pages means reading them. Until
+// 2026-10-21 it read one window of at most 1,500 rows, so list_chats came
+// back empty from about the 1,500th chat on, and a person whose other row
+// fell outside the window showed up again on a later page.
 func (s *Server) chatsPage(ctx context.Context, where string, args []any, offset, limit int) ([]chatRow, error) {
-	window := (offset + limit) * 3
-	if window > 1500 {
-		window = 1500
+	if offset < 0 {
+		offset = 0
+	}
+	page := []chatRow{}
+	if limit < 1 {
+		return page, nil
 	}
 	query := `SELECT jid, chat_type, COALESCE(name, ''), COALESCE(last_message_time, 0),
 	                 COALESCE(last_message_preview, ''), unread_count
@@ -107,29 +89,91 @@ func (s *Server) chatsPage(ctx context.Context, where string, args []any, offset
 	if where != "" {
 		query += " WHERE " + where
 	}
-	query += " ORDER BY last_message_time DESC LIMIT ?"
-	rows, err := s.db.QueryContext(ctx, query, append(args, window)...)
-	if err != nil {
-		return nil, err
-	}
-	var all []chatRow
-	for rows.Next() {
-		var c chatRow
-		if rows.Scan(&c.JID, &c.ChatType, &c.Name, &c.LastMessageTime, &c.LastMessagePreview, &c.UnreadCount) == nil {
-			all = append(all, c)
+	query += " ORDER BY last_message_time DESC, jid LIMIT ? OFFSET ?"
+
+	batchSize := min(max(2*(offset+limit), 50), chatScanBatch)
+	listed := map[string]bool{} // alias keys of the people counted so far
+	for scanned := 0; len(page) < limit; scanned += batchSize {
+		batchArgs := append(append([]any{}, args...), batchSize, scanned)
+		rows, err := s.db.QueryContext(ctx, query, batchArgs...)
+		if err != nil {
+			return nil, err
+		}
+		var batch []chatRow
+		for rows.Next() {
+			var c chatRow
+			if err := rows.Scan(&c.JID, &c.ChatType, &c.Name, &c.LastMessageTime, &c.LastMessagePreview, &c.UnreadCount); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			batch = append(batch, c)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		jids := make([]string, len(batch))
+		for i, c := range batch {
+			jids[i] = c.JID
+		}
+		keys := aliasKeys(ctx, s.db, jids)
+		for _, c := range batch {
+			if key := keys[c.JID]; !listed[key] {
+				listed[key] = true
+				if len(listed) > offset && len(page) < limit {
+					page = append(page, c)
+				}
+			}
+		}
+		if len(batch) < batchSize {
+			break
 		}
 	}
-	rows.Close()
+	s.fillMerged(ctx, page)
+	return page, nil
+}
 
-	merged := mergeChatRows(ctx, s.db, all)
-	if offset >= len(merged) {
-		return []chatRow{}, nil
+// fillMerged completes each listed person with the chat rows they have under
+// their other JIDs, wherever those rows sit in the list: merged_jids names
+// them all and unread counts add up. The listed row keeps its own name and
+// preview, and takes the other rows' name when it has none.
+func (s *Server) fillMerged(ctx context.Context, page []chatRow) {
+	if len(page) == 0 {
+		return
 	}
-	end := offset + limit
-	if end > len(merged) {
-		end = len(merged)
+	index := make(map[string]int, len(page))
+	heads := make([]string, len(page))
+	for i, c := range page {
+		index[c.JID] = i
+		heads[i] = c.JID
 	}
-	return merged[offset:end], nil
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT a.jid_a, c.jid, c.unread_count, COALESCE(c.name, '')
+		   FROM jid_aliases a JOIN chats c ON c.jid = a.jid_b
+		  WHERE a.jid_a IN (`+inClausePlaceholders(len(heads))+`)
+		  ORDER BY c.last_message_time DESC, c.jid`, jidsToArgs(heads)...)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var head, jid, name string
+		var unread int
+		if rows.Scan(&head, &jid, &unread, &name) != nil || jid == head {
+			continue
+		}
+		c := &page[index[head]]
+		if len(c.MergedJIDs) == 0 {
+			c.MergedJIDs = []string{c.JID}
+		}
+		c.MergedJIDs = append(c.MergedJIDs, jid)
+		c.UnreadCount += unread
+		if c.Name == "" {
+			c.Name = name
+		}
+	}
 }
 
 // handleSearchChats finds chats — groups, people, broadcast lists — by name,

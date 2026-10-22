@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -66,6 +67,57 @@ func TestListChatsShowsOnePersonOnce(t *testing.T) {
 	second := getChats(t, s, s.handleListChats, "/api/chats?limit=1&offset=1")
 	if second.Count != 1 || second.Chats[0].Name != "Otra persona" {
 		t.Fatalf("page 2 = %+v", second.Chats)
+	}
+}
+
+// TestListChatsPagesThroughEveryChat: pages are counted in people across
+// batches, past the 1,500 rows the old single window stopped at, and a
+// person whose other row is far down the list is folded into their entry
+// instead of turning up again on a later page.
+func TestListChatsPagesThroughEveryChat(t *testing.T) {
+	s, db := newMediaTestServer(t)
+	defer func(n int) { chatScanBatch = n }(chatScanBatch)
+	chatScanBatch = 7
+
+	const people = 40
+	for i := 0; i < people; i++ {
+		seedChatAt(t, db, fmt.Sprintf("52155500%05d@s.whatsapp.net", i), "direct", fmt.Sprintf("Persona %d", i), int64(10000-i), 1)
+	}
+	// Persona 3 also wrote from a @lid long ago: last in the list.
+	seedChatAt(t, db, "100000000000003@lid", "direct", "", 5, 2)
+	aliasPair(t, db, "5215550000003@s.whatsapp.net", "100000000000003@lid")
+
+	var names []string
+	for offset := 0; ; offset += 6 {
+		out := getChats(t, s, s.handleListChats, fmt.Sprintf("/api/chats?limit=6&offset=%d", offset))
+		if out.Count == 0 {
+			break
+		}
+		for _, c := range out.Chats {
+			names = append(names, c.Name)
+			if c.Name == "Persona 3" && (c.UnreadCount != 3 || len(c.MergedJIDs) != 2) {
+				t.Fatalf("Persona 3 not merged with the @lid row further down: %+v", c)
+			}
+		}
+	}
+	if len(names) != people {
+		t.Fatalf("paged through %d entries, want %d people: %v", len(names), people, names)
+	}
+	for i, n := range names {
+		if n != fmt.Sprintf("Persona %d", i) {
+			t.Fatalf("entry %d is %q: %v", i, n, names)
+		}
+	}
+
+	// Out-of-range paging answers empty pages instead of failing.
+	for _, q := range []string{"limit=5&offset=-3", "limit=0", "limit=-1&offset=2", "limit=5&offset=100"} {
+		out := getChats(t, s, s.handleListChats, "/api/chats?"+q)
+		if q == "limit=5&offset=-3" && (out.Count != 5 || out.Chats[0].Name != "Persona 0") {
+			t.Fatalf("%s: %+v", q, out.Chats)
+		}
+		if q != "limit=5&offset=-3" && out.Count != 0 {
+			t.Fatalf("%s: want an empty page, got %+v", q, out.Chats)
+		}
 	}
 }
 

@@ -184,8 +184,11 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			messagesInserted++
 			msgsForChat++
 
-			if sortTS := chatSortTime(ts, time.Now()); sortTS > lastTs {
-				lastTs = sortTS
+			// A message dated in the future is a bad timestamp, not the
+			// chat's newest message: it keeps its row but does not sort or
+			// preview the chat (chat_time.go).
+			if believableTime(ts, time.Now()) && ts > lastTs {
+				lastTs = ts
 				lastPreview = truncate(content, 120)
 			}
 		}

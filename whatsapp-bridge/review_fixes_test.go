@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,8 +15,12 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 )
 
 func seedDraft(t *testing.T, s *Server, id, status string, createdAt int64, filePath string) {
@@ -358,18 +363,49 @@ func TestChatSortTimeClampsTheFuture(t *testing.T) {
 // TestMigration008RepairsChatsFromTheFuture: the chat pinned at the top by an
 // image dated 2044 goes back to the time of its newest believable message,
 // and the message itself is left alone.
+// TestHistoryLeavesFutureDatesOutOfTheChatList: in history a message dated
+// in the future is a bad timestamp, not news; clamping it to "now" sent a
+// years-old chat to the top of the list on every resync. Messages the live
+// path keeps out of previews stay out here too.
+func TestHistoryLeavesFutureDatesOutOfTheChatList(t *testing.T) {
+	now := time.Unix(1792557000, 0)
+	hs := func(ts int64, m *waE2E.Message) *waHistorySync.HistorySyncMsg {
+		return &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{
+			MessageTimestamp: proto.Uint64(uint64(ts)), Message: m}}
+	}
+	msgs := []*waHistorySync.HistorySyncMsg{
+		hs(1784309593, &waE2E.Message{Conversation: proto.String("hola")}),
+		hs(2359569747, &waE2E.Message{Conversation: proto.String("del 2044")}),
+		hs(1784309700, &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_REVOKE.Enum()}}),
+		{},
+	}
+	ts, preview := newestForChatList(msgs, now)
+	if ts != 1784309593 || preview != "hola" {
+		t.Fatalf("got (%d, %q), want the newest believable, visible message", ts, preview)
+	}
+	if ts, _ := newestForChatList(msgs[1:2], now); ts != 0 {
+		t.Fatalf("a chunk with only a future message sorted its chat at %d", ts)
+	}
+}
+
 func TestMigration008RepairsChatsFromTheFuture(t *testing.T) {
 	_, db := newMediaTestServer(t)
 	const pedro = "5215550227630@s.whatsapp.net"
 	seedChat(t, db, pedro, "direct", "Pedro")
 	seedChat(t, db, "5215550000001@s.whatsapp.net", "direct", "Otro")
+	const onlyFuture = "5215550000009@s.whatsapp.net"
+	seedChat(t, db, onlyFuture, "direct", "Solo futuro")
 	if _, err := db.Exec(`
 		INSERT INTO messages (id, chat_jid, sender_jid, timestamp, type, content_text, is_from_me) VALUES
-		  ('OK1', ?, '', 1784309593, 'image', '', 1),
-		  ('BOGUS', ?, '', 2359569747, 'image', '', 1)`, pedro, pedro); err != nil {
+		  ('OK1', ?, '', 1784309593, 'image', 'Foto del recibo', 1),
+		  ('BLANK', ?, '', 1784309600, 'system', '', 0),
+		  ('BOGUS', ?, '', 2359569747, 'image', '', 1),
+		  ('BOGUS2', ?, '', 2359569747, 'text', 'del futuro', 1)`, pedro, pedro, pedro, onlyFuture); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE chats SET last_message_time = 2359569747 WHERE jid = ?`, pedro); err != nil {
+	if _, err := db.Exec(`UPDATE chats SET last_message_time = 2359569747, last_message_id = 'BOGUS', last_message_preview = ''
+		WHERE jid IN (?, ?)`, pedro, onlyFuture); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE chats SET last_message_time = 1780000000 WHERE jid = '5215550000001@s.whatsapp.net'`); err != nil {
@@ -390,6 +426,16 @@ func TestMigration008RepairsChatsFromTheFuture(t *testing.T) {
 	db.QueryRow(`SELECT timestamp FROM messages WHERE id = 'BOGUS'`).Scan(&msgTS)
 	if got != 1784309593 {
 		t.Fatalf("repaired chat time = %d, want the newest believable message (1784309593)", got)
+	}
+	var lastID, preview string
+	db.QueryRow(`SELECT last_message_id, last_message_preview FROM chats WHERE jid = ?`, pedro).Scan(&lastID, &preview)
+	if lastID != "OK1" || preview != "Foto del recibo" {
+		t.Fatalf("repaired chat still points at %q with preview %q, want OK1's", lastID, preview)
+	}
+	var futureTime sql.NullInt64
+	db.QueryRow(`SELECT last_message_time FROM chats WHERE jid = ?`, onlyFuture).Scan(&futureTime)
+	if futureTime.Valid {
+		t.Fatalf("a chat with only a message from the future should lose its time, got %d", futureTime.Int64)
 	}
 	if other != 1780000000 {
 		t.Fatalf("a healthy chat was changed: %d", other)

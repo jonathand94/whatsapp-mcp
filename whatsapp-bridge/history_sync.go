@@ -43,6 +43,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -99,19 +100,7 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 
 		// Newest message in this conversation, used to seed the chat row's
 		// sort key + preview without regressing a live chat's fresher values.
-		var convMaxTS int64
-		var convPreview string
-		for _, hsMsg := range msgs {
-			wm := hsMsg.GetMessage()
-			if wm == nil {
-				continue
-			}
-			if ts := chatSortTime(int64(wm.GetMessageTimestamp()), time.Now()); ts >= convMaxTS {
-				convMaxTS = ts
-				c, _ := extractContentFromProto(wm.GetMessage())
-				convPreview = truncate(c, 120)
-			}
-		}
+		convMaxTS, convPreview := newestForChatList(msgs, time.Now())
 
 		// Ensure the chat row exists BEFORE inserting messages: messages.chat_jid
 		// has a FOREIGN KEY to chats(jid) and the message DB runs with foreign_keys
@@ -270,6 +259,28 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 	}
 	log.Printf("history_sync: scanned %d msgs across %d conversations (progress=%d), inserted %d new, saw %d media-bearing, backfilled %d media rows, re-decoded %d empty rows",
 		scanned, len(convs), chunk.GetProgress(), inserted, mediaSeen, updated, decoded)
+}
+
+// newestForChatList picks the message a history chunk sorts and previews its
+// chat by: the newest one, leaving out what the live path keeps out of chat
+// previews (hiddenFromChatPreview) and anything dated more than futureSlack
+// ahead, which in history is a bad timestamp rather than news (chat_time.go).
+// ts is 0 when no message qualifies.
+func newestForChatList(msgs []*waHistorySync.HistorySyncMsg, now time.Time) (ts int64, preview string) {
+	for _, hsMsg := range msgs {
+		wm := hsMsg.GetMessage()
+		if wm == nil || hiddenFromChatPreview(wm.GetMessage()) {
+			continue
+		}
+		t := int64(wm.GetMessageTimestamp())
+		if !believableTime(t, now) || t < ts {
+			continue
+		}
+		ts = t
+		c, _ := extractContentFromProto(wm.GetMessage())
+		preview = truncate(c, 120)
+	}
+	return ts, preview
 }
 
 // chatTypeFromJIDString parses a raw JID string and returns the chats.chat_type
