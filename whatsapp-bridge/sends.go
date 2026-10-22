@@ -541,6 +541,10 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 			FFmpegBin:  s.cfg.FFmpegBinPath,
 		}
 		up, started := s.jobs().start("send:"+draftID, func(j *mediaJob) (int, any) {
+			// Whatever way the job ends — a panic included, which the job
+			// table recovers — the ticket is settled: a turn never given back
+			// would block every later send to this chat until a restart.
+			defer ticket.abandon()
 			ctx, cancel := context.WithTimeout(s.rootContext(), mediaJobTimeout)
 			defer cancel()
 
@@ -615,6 +619,7 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	default:
+		ticket.abandon()
 		writeJSON(w, http.StatusInternalServerError, errorResponse{
 			Error:   fmt.Sprintf("unsupported send_type %q reached confirm", sendType),
 			Details: "this is a bug; the draft insert validator should have rejected it",
@@ -625,6 +630,11 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	// A text is ready the moment it is confirmed, and its caller is waiting
 	// on this request, so it waits for its turn in the chat only up to
 	// MaxTextWait. Giving up leaves nothing half-done and the draft usable.
+	// The deferred abandon settles the ticket on any path that did not, a
+	// panic included (net/http recovers it): a turn never given back would
+	// block every later send to this chat until a restart. After abandon or
+	// sent it does nothing.
+	defer ticket.abandon()
 	release, err := gov.ClaimSend(r.Context(), chatKey, gov.limits.MaxTextWait)
 	if err != nil {
 		ticket.abandon()

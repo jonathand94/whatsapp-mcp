@@ -485,3 +485,26 @@ func TestMigration008RepairsChatsFromTheFuture(t *testing.T) {
 		t.Fatal("the message's own timestamp must be left as it came")
 	}
 }
+
+// TestATurnIsGivenBackWhenTheSendPanics: a send that panics while holding its
+// chat's turn must not leave the chat blocked until a restart.
+func TestATurnIsGivenBackWhenTheSendPanics(t *testing.T) {
+	g := newSendGovernor(defaultSendLimits())
+	func() {
+		defer func() { _ = recover() }()
+		ticket := &sendTicket{gov: g, decision: g.Authorize("chat-p", false, time.Now())}
+		defer ticket.abandon()
+		release, err := g.ClaimSend(t.Context(), "chat-p", -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ticket.release = release
+		panic("boom")
+	}()
+	start := time.Now()
+	release, err := g.ClaimSend(t.Context(), "chat-p", time.Second)
+	if err != nil || time.Since(start) > 100*time.Millisecond {
+		t.Fatalf("the chat is still blocked after the panic: %v", err)
+	}
+	release(time.Time{})
+}
