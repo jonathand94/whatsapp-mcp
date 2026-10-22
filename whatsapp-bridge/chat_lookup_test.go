@@ -373,3 +373,51 @@ func TestPlumbingIsWhatTheDecoderFindsEmpty(t *testing.T) {
 		}
 	}
 }
+
+// TestAPersonWithThreeJIDsIsOnePerson: a @lid seen with an old and a new
+// number links three JIDs, and the numbers are not aliases of each other.
+// Keyed by direct aliases only, the two numbers fell apart whenever the @lid
+// did not sort first: list_chats lost a chat or listed the person twice, and
+// unread counts were wrong (2026-10-21 review). The @lid here sorts last.
+func TestAPersonWithThreeJIDsIsOnePerson(t *testing.T) {
+	s, db := newMediaTestServer(t)
+	const oldNum, newNum, lid = "5215550000001@s.whatsapp.net", "5215550000002@s.whatsapp.net", "900000000000001@lid"
+	seedChatAt(t, db, newNum, "direct", "Ana", 300, 1)
+	seedChatAt(t, db, "5215550000005@s.whatsapp.net", "direct", "Otra persona", 250, 0)
+	seedChatAt(t, db, lid, "direct", "", 200, 10)
+	seedChatAt(t, db, oldNum, "direct", "Ana (anterior)", 100, 100)
+	aliasPair(t, db, oldNum, lid)
+	aliasPair(t, db, newNum, lid)
+
+	out := getChats(t, s, s.handleListChats, "/api/chats?limit=10")
+	if out.Count != 2 {
+		t.Fatalf("want Ana and one other person, got %d: %+v", out.Count, out.Chats)
+	}
+	ana := out.Chats[0]
+	if ana.JID != newNum || ana.UnreadCount != 111 || len(ana.MergedJIDs) != 3 {
+		t.Fatalf("Ana = %+v, want her newest chat with all three JIDs and 111 unread", ana)
+	}
+	for offset := 0; offset < 3; offset++ {
+		page := getChats(t, s, s.handleListChats, fmt.Sprintf("/api/chats?limit=1&offset=%d", offset))
+		if offset < 2 && page.Count != 1 || offset == 2 && page.Count != 0 {
+			t.Fatalf("page %d: %+v", offset, page.Chats)
+		}
+	}
+
+	got, err := resolveAliases(t.Context(), db, oldNum)
+	if err != nil || strings.Join(got, " ") != oldNum+" "+newNum+" "+lid {
+		t.Fatalf("resolveAliases(old number) = %v, %v", got, err)
+	}
+
+	// The governor sees one person too: the new number is not a stranger when
+	// she wrote from the old one.
+	if _, err := db.Exec(`INSERT INTO messages (id, chat_jid, sender_jid, timestamp, type, content_text, is_from_me)
+		VALUES ('in-1', ?, ?, 100, 'text', 'hola', 0)`, oldNum, oldNum); err != nil {
+		t.Fatal(err)
+	}
+	keyNew, isNew, err := s.classifyRecipient(t.Context(), newNum)
+	keyOld, _, _ := s.classifyRecipient(t.Context(), oldNum)
+	if err != nil || isNew || keyNew != keyOld {
+		t.Fatalf("new number: key %q (old %q), new=%t, err %v", keyNew, keyOld, isNew, err)
+	}
+}

@@ -34,33 +34,6 @@ func nonADJID(jid string) string {
 	return jid
 }
 
-// aliasKeys maps each JID to the key its person is grouped under: the smallest
-// JID among it and its aliases, so every form of one person gets the same key
-// whichever form is at hand. One query for the whole set.
-func aliasKeys(ctx context.Context, db *sql.DB, jids []string) map[string]string {
-	keys := make(map[string]string, len(jids))
-	for _, j := range jids {
-		keys[j] = j
-	}
-	if len(jids) == 0 {
-		return keys
-	}
-	rows, err := db.QueryContext(ctx,
-		`SELECT jid_a, jid_b FROM jid_aliases WHERE jid_a IN (`+inClausePlaceholders(len(jids))+`)`,
-		jidsToArgs(jids)...)
-	if err != nil {
-		return keys
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var a, b string
-		if rows.Scan(&a, &b) == nil && b < keys[a] {
-			keys[a] = b
-		}
-	}
-	return keys
-}
-
 // chatScanBatch is the most chat rows chatsPage reads per query; a first
 // page reads fewer (twice what it shows, at least 50).
 var chatScanBatch = 500
@@ -118,7 +91,7 @@ func (s *Server) chatsPage(ctx context.Context, where string, args []any, offset
 		for i, c := range batch {
 			jids[i] = c.JID
 		}
-		keys := aliasKeys(ctx, s.db, jids)
+		keys, _, _ := aliasGroups(ctx, s.db, jids)
 		for _, c := range batch {
 			if key := keys[c.JID]; !listed[key] {
 				listed[key] = true
@@ -143,36 +116,47 @@ func (s *Server) fillMerged(ctx context.Context, page []chatRow) {
 	if len(page) == 0 {
 		return
 	}
-	index := make(map[string]int, len(page))
 	heads := make([]string, len(page))
 	for i, c := range page {
-		index[c.JID] = i
 		heads[i] = c.JID
 	}
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT a.jid_a, c.jid, c.unread_count, COALESCE(c.name, '')
-		   FROM jid_aliases a JOIN chats c ON c.jid = a.jid_b
-		  WHERE a.jid_a IN (`+inClausePlaceholders(len(heads))+`)
-		  ORDER BY c.last_message_time DESC, c.jid`, jidsToArgs(heads)...)
-	if err != nil {
-		return
+	keys, members, _ := aliasGroups(ctx, s.db, heads)
+	owner := map[string]int{}
+	var others []string
+	for i, c := range page {
+		for _, j := range members[keys[c.JID]] {
+			if j != c.JID {
+				owner[j] = i
+				others = append(others, j)
+			}
+		}
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var head, jid, name string
-		var unread int
-		if rows.Scan(&head, &jid, &unread, &name) != nil || jid == head {
-			continue
+	for start := 0; start < len(others); start += aliasBatch {
+		batch := others[start:min(start+aliasBatch, len(others))]
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT jid, unread_count, COALESCE(name, '') FROM chats
+			  WHERE jid IN (`+inClausePlaceholders(len(batch))+`)
+			  ORDER BY last_message_time DESC, jid`, jidsToArgs(batch)...)
+		if err != nil {
+			return
 		}
-		c := &page[index[head]]
-		if len(c.MergedJIDs) == 0 {
-			c.MergedJIDs = []string{c.JID}
+		for rows.Next() {
+			var jid, name string
+			var unread int
+			if rows.Scan(&jid, &unread, &name) != nil {
+				continue
+			}
+			c := &page[owner[jid]]
+			if len(c.MergedJIDs) == 0 {
+				c.MergedJIDs = []string{c.JID}
+			}
+			c.MergedJIDs = append(c.MergedJIDs, jid)
+			c.UnreadCount += unread
+			if c.Name == "" {
+				c.Name = name
+			}
 		}
-		c.MergedJIDs = append(c.MergedJIDs, jid)
-		c.UnreadCount += unread
-		if c.Name == "" {
-			c.Name = name
-		}
+		rows.Close()
 	}
 }
 
@@ -224,7 +208,7 @@ func mergeContacts(ctx context.Context, db *sql.DB, rows []contactRow) []contact
 		rows[i].JID = nonADJID(rows[i].JID)
 		jids = append(jids, rows[i].JID)
 	}
-	keys := aliasKeys(ctx, db, jids)
+	keys, people, _ := aliasGroups(ctx, db, jids)
 
 	groups := map[string][]contactRow{}
 	var order []string
@@ -264,10 +248,8 @@ func mergeContacts(ctx context.Context, db *sql.DB, rows []contactRow) []contact
 			}
 			head.IsBusiness = head.IsBusiness || m.IsBusiness
 		}
-		if aliases, err := resolveAliases(ctx, db, head.JID); err == nil {
-			for _, a := range aliases[1:] {
-				forms[a] = true
-			}
+		for _, a := range people[key] {
+			forms[a] = true
 		}
 		head.Aliases = nil
 		for f := range forms {

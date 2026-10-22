@@ -28,6 +28,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -57,30 +58,125 @@ func recordJIDAlias(ctx context.Context, db *sql.DB, a, b types.JID, source stri
 }
 
 // resolveAliases returns every JID known to refer to the same human as `jid`,
-// including `jid` itself. The result is order-preserving with `jid` first so
-// callers can pass the slice straight into a parameterised IN-clause.
+// including `jid` itself: everything connected to it through jid_aliases (see
+// aliasGroups). `jid` comes first and the rest are sorted, so callers can pass
+// the slice straight into a parameterised IN-clause.
 func resolveAliases(ctx context.Context, db *sql.DB, jid string) ([]string, error) {
 	if jid == "" {
 		return nil, nil
 	}
+	keys, members, err := aliasGroups(ctx, db, []string{jid})
 	out := []string{jid}
-	rows, err := db.QueryContext(ctx, `SELECT jid_b FROM jid_aliases WHERE jid_a = ?`, jid)
-	if err != nil {
-		return out, fmt.Errorf("resolveAliases: %w", err)
-	}
-	defer rows.Close()
-	seen := map[string]bool{jid: true}
-	for rows.Next() {
-		var alt string
-		if err := rows.Scan(&alt); err != nil {
-			continue
-		}
-		if !seen[alt] {
-			seen[alt] = true
+	for _, alt := range members[keys[jid]] {
+		if alt != jid {
 			out = append(out, alt)
 		}
 	}
+	if err != nil {
+		return out, fmt.Errorf("resolveAliases: %w", err)
+	}
 	return out, nil
+}
+
+// maxAliasHops bounds how far aliasGroups follows jid_aliases from a JID. A
+// person is usually two JIDs, a phone JID and a @lid; a @lid seen with an old
+// and a new number links three, two hops apart. Nothing real is further.
+const maxAliasHops = 4
+
+// aliasBatch is the most JIDs one alias or chat lookup puts in an IN clause.
+const aliasBatch = 500
+
+// aliasGroups returns, for each of jids, the key of the person it belongs to,
+// and each key's JIDs, sorted: everything connected to it through jid_aliases,
+// not only its direct aliases. The key is the smallest of them, so every form
+// of one person gets the same key whichever form is at hand.
+//
+// Direct aliases were enough while a person was one phone JID and one @lid.
+// A @lid linked to an old and a new number is three, and keying each JID by
+// its direct aliases alone split the two numbers whenever the @lid did not
+// sort first: lists showed the person twice, or lost one of their chats
+// (2026-10-21 review).
+//
+// A failed lookup leaves the JIDs it concerned ungrouped and is returned
+// after everything else has been resolved: a person shown twice beats a list
+// that fails.
+func aliasGroups(ctx context.Context, db *sql.DB, jids []string) (keys map[string]string, members map[string][]string, err error) {
+	// Union-find whose roots are the smallest JID of their group.
+	parent := map[string]string{}
+	find := func(j string) string {
+		for parent[j] != j {
+			parent[j] = parent[parent[j]]
+			j = parent[j]
+		}
+		return j
+	}
+	add := func(j string) bool {
+		if _, ok := parent[j]; ok {
+			return false
+		}
+		parent[j] = j
+		return true
+	}
+	union := func(a, b string) {
+		ra, rb := find(a), find(b)
+		if rb < ra {
+			ra, rb = rb, ra
+		}
+		parent[rb] = ra
+	}
+
+	var frontier []string
+	for _, j := range jids {
+		if j != "" && add(j) {
+			frontier = append(frontier, j)
+		}
+	}
+	for hop := 0; hop < maxAliasHops && len(frontier) > 0; hop++ {
+		var next []string
+		for start := 0; start < len(frontier); start += aliasBatch {
+			batch := frontier[start:min(start+aliasBatch, len(frontier))]
+			rows, qErr := db.QueryContext(ctx,
+				`SELECT jid_a, jid_b FROM jid_aliases WHERE jid_a IN (`+inClausePlaceholders(len(batch))+`)`,
+				jidsToArgs(batch)...)
+			if qErr != nil {
+				if err == nil {
+					err = qErr
+				}
+				continue
+			}
+			for rows.Next() {
+				var a, b string
+				if rows.Scan(&a, &b) != nil || b == "" {
+					continue
+				}
+				if add(b) {
+					next = append(next, b)
+				}
+				union(a, b)
+			}
+			if rErr := rows.Err(); rErr != nil && err == nil {
+				err = rErr
+			}
+			rows.Close()
+		}
+		frontier = next
+	}
+
+	keys = make(map[string]string, len(jids))
+	members = map[string][]string{}
+	for j := range parent {
+		root := find(j)
+		members[root] = append(members[root], j)
+	}
+	for _, group := range members {
+		sort.Strings(group)
+	}
+	for _, j := range jids {
+		if j != "" {
+			keys[j] = find(j)
+		}
+	}
+	return keys, members, err
 }
 
 // inClausePlaceholders returns "?,?,?" for n=3 etc. for parameterised IN().
