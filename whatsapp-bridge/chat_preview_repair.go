@@ -86,6 +86,13 @@ var legacyMarkerLabels = map[string]string{
 	"ptvMessage":                 "Videomensaje",
 }
 
+// currentMarkerTexts are said in full: messages WhatsApp never shows on a
+// linked device, so there was never content to keep (2026-10-23: two chats'
+// previews read "[unsupported: placeholderMessage]").
+var currentMarkerTexts = map[string]string{
+	"placeholderMessage": "[Mensaje que WhatsApp solo muestra en el teléfono]",
+}
+
 // friendlyMarker is the text shown for a stored marker whose every field has
 // a label, or "" for anything else (real text, a marker of a type still
 // unknown, which keeps its marker).
@@ -93,6 +100,9 @@ func friendlyMarker(text string) string {
 	raw := unsupportedRawType(text)
 	if raw == "" {
 		return ""
+	}
+	if full, ok := currentMarkerTexts[raw]; ok {
+		return full
 	}
 	var labels []string
 	for _, name := range strings.Split(raw, ",") {

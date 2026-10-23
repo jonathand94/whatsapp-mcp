@@ -124,6 +124,7 @@ func TestOldMarkersSayWhatTheyWere(t *testing.T) {
 		"[unsupported: pollCreationMessageV3]":          "[Encuesta: mensaje antiguo, su contenido no se guardó]",
 		"[unsupported: templateMessage]":                "[Mensaje de plantilla de una empresa: mensaje antiguo, su contenido no se guardó]",
 		"[unsupported: someFutureMessage]":              "",
+		"[unsupported: placeholderMessage]":             "[Mensaje que WhatsApp solo muestra en el teléfono]",
 		"[unsupported: albumMessage,someFutureMessage]": "",
 		"hola": "",
 	} {
