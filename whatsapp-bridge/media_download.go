@@ -294,17 +294,18 @@ func (b *Bridge) DownloadMediaFile(ctx context.Context, messageID string, job *m
 
 	if isExpiredMedia(err) {
 		cdnErr := err
-		job.setPhase("WhatsApp ya no lo tiene; pidiendoselo al telefono")
+		why := cdnProblem(cdnErr)
+		job.setPhase(why + "; pidiendoselo al telefono")
 		info, ierr := messageInfoForRetry(messageID, chatJID, senderJID, isFromMe == 1)
 		if ierr != nil {
-			return resp, fmt.Errorf("%w (%v) y no se puede pedir al telefono: %v", errMediaGone, cdnErr, ierr)
+			return resp, fmt.Errorf("%w: %s, y no se puede pedir al telefono: %v", errMediaGone, why, ierr)
 		}
 		newPath, rerr := b.requestMediaReupload(ctx, info, mediaKey)
 		if errors.Is(rerr, errNotOnPhone) {
-			return resp, fmt.Errorf("%w (%v), y %v", errMediaGone, cdnErr, rerr)
+			return resp, fmt.Errorf("%w: %s, y %v", errMediaGone, why, rerr)
 		}
 		if rerr != nil {
-			return resp, fmt.Errorf("%w (%v): %v", errPhoneUnreachable, cdnErr, rerr)
+			return resp, fmt.Errorf("%w: %s, y %v", errPhoneUnreachable, why, rerr)
 		}
 		// Recorded straight away, so if the second attempt fails for some
 		// unrelated reason the next one starts from the fresh path instead of
@@ -323,6 +324,9 @@ func (b *Bridge) DownloadMediaFile(ctx context.Context, messageID string, job *m
 		job.setPhase("descargando de WhatsApp")
 		err = b.downloadWithRetries(ctx, dl, part, written, job)
 		resp.RecoveredFromPhone = err == nil
+		if isMismatchedMedia(err) {
+			err = fmt.Errorf("%w: la copia que el telefono volvio a subir tampoco coincide con la del mensaje", errMediaGone)
+		}
 	}
 	if err != nil {
 		return resp, fmt.Errorf("whatsmeow download: %w", err)
@@ -669,22 +673,34 @@ func (s *Server) handleDownloadMedia(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := "download:" + body.MessageID
+	// A download that failed after its caller stopped waiting keeps its
+	// answer for the next request, once. Asking the phone alone can take two
+	// minutes, longer than any request waits, and until 2026-10-22 a failed
+	// job was dropped the moment it ended: every poll started a fresh
+	// attempt, and a caller saw "downloading" for over an hour. A failure a
+	// caller already got is not repeated; the request after it tries again.
+	if prev := s.jobs().get(key); prev != nil && !prev.running() {
+		s.jobs().forget(key, prev)
+		if !prev.delivered.Swap(true) {
+			writeJSON(w, prev.status, prev.body)
+			return
+		}
+	}
 	j, _ := s.jobs().start(key, func(j *mediaJob) (int, any) {
 		ctx, cancel := context.WithTimeout(s.rootContext(), mediaJobTimeout)
 		defer cancel()
 		stop, stalled := watchStall(cancel, j.activity, stallTimeout)
 		resp, err := s.bridge.DownloadMediaFile(ctx, body.MessageID, j)
 		stop()
-		// The outcome is in the messages table now (or the failure is worth
-		// retrying), so the next request should start fresh rather than be
-		// handed this job's answer.
-		s.jobs().forget(key, j)
 		if err != nil {
 			if stalled.Load() {
 				err = fmt.Errorf("la descarga se detuvo: no llegaron datos en %s", stallTimeout)
 			}
 			return downloadErrorStatus(err), downloadErrorBody(err)
 		}
+		// The outcome is in the messages table now, so the next request
+		// takes the fast path instead of this job's answer.
+		s.jobs().forget(key, j)
 		return http.StatusOK, resp
 	})
 	answerJob(w, r, j, jobPending{
@@ -704,7 +720,7 @@ func downloadErrorStatus(err error) int {
 		strings.Contains(msg, "media key not available"),
 		strings.Contains(msg, "is not downloadable"):
 		return http.StatusNotFound
-	case errors.Is(err, errMediaGone):
+	case errors.Is(err, errMediaGone), isMismatchedMedia(err):
 		return http.StatusGone
 	case errors.Is(err, errPhoneUnreachable):
 		return http.StatusServiceUnavailable
@@ -718,9 +734,14 @@ func downloadErrorBody(err error) errorResponse {
 	case http.StatusNotFound:
 		return errorResponse{Error: err.Error()}
 	case http.StatusGone:
+		details := err.Error()
+		if !errors.Is(err, errMediaGone) {
+			// whatsmeow's words ("invalid media hmac") tell a person nothing.
+			details = cdnProblem(err)
+		}
 		return errorResponse{
 			Error:   "media no longer available",
-			Details: err.Error() + ". Pidele a quien lo envio que lo mande otra vez.",
+			Details: details + ". Pidele a quien lo envio que lo mande otra vez.",
 		}
 	case http.StatusServiceUnavailable:
 		return errorResponse{

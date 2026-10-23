@@ -37,3 +37,15 @@ def test_date_and_time():
 def test_unrecognised_dates_say_what_works(bad):
     with pytest.raises(ValueError, match="segundos o milisegundos"):
         _to_unix(bad, end_of_day=False)
+
+
+def test_list_chats_refuses_impossible_pages():
+    """offset=-5 used to read as 0 and limit=0 as an empty page, silently."""
+    import asyncio
+
+    import main
+
+    with pytest.raises(ValueError, match="offset"):
+        asyncio.run(main.list_chats(offset=-5))
+    with pytest.raises(ValueError, match="limit"):
+        asyncio.run(main.list_chats(limit=0))

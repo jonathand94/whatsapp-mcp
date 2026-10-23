@@ -626,8 +626,12 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Rows of plumbing stored before the bridge stopped keeping them (see
-	// isPlumbing) are blank; they are left in the database but not shown.
-	where += " AND NOT (type = 'system' AND COALESCE(content_text, '') = '')"
+	// isPlumbing) are blank, and markers of messages with nothing to read
+	// ("[unsupported: protocolMessage]", 3,120 of them by 2026-10-22) are
+	// noise: both stay in the database but are not shown (chat_preview_repair.go).
+	hidden, hiddenArgs := hiddenRowsSQL()
+	where += " AND " + hidden
+	args = append(args, hiddenArgs...)
 
 	// Filters, so finding an attachment does not mean paging through a chat:
 	// media_type (see mediaTypeFilters), since/until (unix seconds, inclusive)
@@ -679,6 +683,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 
 	out := messageListResponse{Messages: []messageRow{}}
 	ownName := s.ownDisplayName()
+	var unnamed []string
 	for rows.Next() {
 		var m messageRow
 		var fromMe int
@@ -688,13 +693,27 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		m.IsFromMe = fromMe == 1
+		// One chat, one JID: a merged chat's older messages are stored under
+		// its other form (the @lid), and a caller saw two chat_jids in one
+		// answer (2026-10-22 test run). They answer for the chat asked about.
+		m.ChatJID = chatJID
 		// The user's own messages synced from the phone often carry no push
 		// name, and were shown as a bare number ("99990069399676"). They are
 		// the user's; say so.
 		if m.IsFromMe && isBareNumber(m.SenderDisplay) {
 			m.SenderDisplay = ownName
+		} else if isBareNumber(m.SenderDisplay) && m.SenderJID != "" {
+			unnamed = append(unnamed, nonADJID(m.SenderJID))
 		}
 		out.Messages = append(out.Messages, m)
+	}
+	if len(unnamed) > 0 {
+		names := s.senderNames(r.Context(), unnamed)
+		for i, m := range out.Messages {
+			if name, ok := names[nonADJID(m.SenderJID)]; ok && !m.IsFromMe && isBareNumber(m.SenderDisplay) {
+				out.Messages[i].SenderDisplay = name
+			}
+		}
 	}
 	out.Count = len(out.Messages)
 	if chat.JID != "" {

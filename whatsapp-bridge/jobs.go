@@ -83,6 +83,8 @@ type mediaJob struct {
 	finished time.Time
 	status   int
 	body     any
+	// delivered: a caller has been handed the final answer.
+	delivered atomic.Bool
 }
 
 func (j *mediaJob) setPhase(p string) {
@@ -257,6 +259,7 @@ func jobWait(r *http.Request) time.Duration {
 // wait, and 202 with its progress otherwise.
 func answerJob(w http.ResponseWriter, r *http.Request, j *mediaJob, p jobPending) {
 	if j.wait(r.Context(), jobWait(r)) {
+		j.delivered.Store(true)
 		writeJSON(w, j.status, j.body)
 		return
 	}

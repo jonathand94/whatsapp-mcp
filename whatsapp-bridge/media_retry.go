@@ -90,12 +90,37 @@ func (b *Bridge) onMediaRetry(evt *events.MediaRetry) {
 	}
 }
 
-// isExpiredMedia reports whether a download failed because the CDN no longer
-// has the file, which is the one failure a media retry can fix.
+// isExpiredMedia reports whether a download failed because WhatsApp's copy of
+// the file is gone, or is not the file the message describes: the failures a
+// fresh upload from the phone can fix. A copy whose ciphertext hash does not
+// match was what old attachments failed with on 2026-10-22, from every CDN
+// host alike; it is deterministic, so retrying the same copy only wasted time.
+// A MAC or plaintext mismatch is not included: those say the message's own
+// key does not fit, and the phone's copy, encrypted with that key, would not
+// fit either.
 func isExpiredMedia(err error) bool {
 	return errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
 		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
-		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410)
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) ||
+		errors.Is(err, whatsmeow.ErrInvalidMediaEncSHA256)
+}
+
+// isMismatchedMedia reports whether the bytes WhatsApp served are not the ones
+// the message describes, whatever the check that caught it.
+func isMismatchedMedia(err error) bool {
+	return errors.Is(err, whatsmeow.ErrInvalidMediaEncSHA256) ||
+		errors.Is(err, whatsmeow.ErrInvalidMediaHMAC) ||
+		errors.Is(err, whatsmeow.ErrInvalidMediaSHA256)
+}
+
+// cdnProblem says, in the user's language, why WhatsApp's copy could not be
+// used: the raw errors ("hash of media ciphertext doesn't match") tell a
+// person nothing.
+func cdnProblem(err error) string {
+	if isMismatchedMedia(err) {
+		return "la copia del archivo en WhatsApp no coincide con la del mensaje (cambio o se dano)"
+	}
+	return "WhatsApp ya no lo tiene en sus servidores"
 }
 
 // requestMediaReupload asks our own phone to upload a message's media again

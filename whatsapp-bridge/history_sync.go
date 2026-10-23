@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -471,9 +472,27 @@ func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, er
 	// backfilled row is byte-identical to what it would have been had the
 	// message arrived today.
 	text, msgType := extractContentFromProto(m)
-	if text == "" {
+	if text == "" && msgType == "system" {
 		// Nothing recovered — leave the row exactly as it is rather than
-		// rewriting it with the same emptiness.
+		// rewriting it with the same emptiness. A photo or voice note with no
+		// caption is something recovered: its type.
+		return 0, nil
+	}
+	// A row stored as a marker by a decoder that did not know its type yet
+	// (6,798 of them on 2026-10-22: templates, albums and their photos,
+	// polls...) is re-decoded too — but only when the new answer is not a
+	// marker again, and the message delivered now really carries the type
+	// the marker names, so text from any other message can never land there.
+	var stored string
+	if err := b.db.QueryRow(`SELECT COALESCE(content_text, '') FROM messages WHERE id = ? AND type = 'system'`,
+		msgID).Scan(&stored); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if raw := unsupportedRawType(stored); raw != "" &&
+		(unsupportedRawType(text) != "" || !carriesFields(m, strings.Split(raw, ","))) {
 		return 0, nil
 	}
 
@@ -493,8 +512,8 @@ func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, er
 		       raw_type           = ?
 		 WHERE id = ?
 		   AND type = 'system'
-		   AND (content_text IS NULL OR content_text = '')
-	`, msgType, text, Normalize(text), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, text), msgID)
+		   AND COALESCE(content_text, '') = ?
+	`, msgType, text, Normalize(text), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, text), msgID, stored)
 	if err != nil {
 		return 0, err
 	}

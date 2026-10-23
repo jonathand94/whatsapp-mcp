@@ -235,6 +235,30 @@ func envelopeUnknownFields(m *waE2E.Message) []string {
 	return names
 }
 
+// carriesFields reports whether m, or a message along its envelope, has every
+// one of the named fields set; unknown fields count under their
+// "unknown_field_N" names, as in markers.
+func carriesFields(m *waE2E.Message, names []string) bool {
+	set := map[string]bool{}
+	seen := map[protowire.Number]bool{}
+	for depth := 0; m != nil && depth <= maxUnwrapDepth; depth++ {
+		m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+			set[string(fd.Name())] = true
+			return true
+		})
+		for _, n := range unknownFieldNames(m.ProtoReflect(), seen) {
+			set[n] = true
+		}
+		m = unwrapOnce(m)
+	}
+	for _, n := range names {
+		if !set[strings.TrimSpace(n)] {
+			return false
+		}
+	}
+	return true
+}
+
 // unknownFieldNames names r's unknown fields by number, skipping numbers
 // already in seen.
 func unknownFieldNames(r protoreflect.Message, seen map[protowire.Number]bool) []string {

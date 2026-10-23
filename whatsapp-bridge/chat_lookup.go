@@ -263,6 +263,63 @@ func mergeContacts(ctx context.Context, db *sql.DB, rows []contactRow) []contact
 	return out
 }
 
+// senderNames labels senders whose messages carry no name, only a number:
+// for each JID, a name from the address book or the sender's own profile under
+// any of their JIDs, else their phone number, else "Desconocido". A bare @lid
+// number ("99990000002312") means nothing to a reader (2026-10-22 test run).
+func (s *Server) senderNames(ctx context.Context, jids []string) map[string]string {
+	keys, members, _ := aliasGroups(ctx, s.db, jids)
+	var all []string
+	for _, j := range jids {
+		all = append(all, members[keys[j]]...)
+	}
+	type known struct{ name, phone string }
+	found := map[string]known{}
+	for start := 0; start < len(all); start += aliasBatch {
+		batch := all[start:min(start+aliasBatch, len(all))]
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT jid, COALESCE(NULLIF(full_name, ''), NULLIF(push_name, ''), NULLIF(verified_name, ''), ''),
+			        COALESCE(phone, '')
+			   FROM contacts WHERE jid IN (`+inClausePlaceholders(len(batch))+`)`, jidsToArgs(batch)...)
+		if err != nil {
+			break
+		}
+		for rows.Next() {
+			var jid string
+			var k known
+			if rows.Scan(&jid, &k.name, &k.phone) == nil {
+				found[jid] = k
+			}
+		}
+		rows.Close()
+	}
+	names := make(map[string]string, len(jids))
+	for _, j := range jids {
+		var name, phone string
+		for _, m := range members[keys[j]] {
+			k := found[m]
+			if name == "" && !isBareNumber(k.name) {
+				name = k.name
+			}
+			if phone == "" {
+				phone = k.phone
+			}
+			if phone == "" && strings.HasSuffix(m, "@"+types.DefaultUserServer) {
+				phone = strings.TrimSuffix(m, "@"+types.DefaultUserServer)
+			}
+		}
+		switch {
+		case name != "":
+			names[j] = name
+		case phone != "":
+			names[j] = "+" + strings.TrimPrefix(phone, "+")
+		default:
+			names[j] = "Desconocido"
+		}
+	}
+	return names
+}
+
 // ownDisplayName is how the user's own messages are labelled: their WhatsApp
 // name, or "Yo" when the bridge does not know it.
 func (s *Server) ownDisplayName() string {

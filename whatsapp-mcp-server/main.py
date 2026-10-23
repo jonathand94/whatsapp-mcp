@@ -443,6 +443,12 @@ async def list_chats(limit: int = 20, offset: int = 0, unread_only: bool = False
         offset: Pagination offset.
         unread_only: If true, return only chats with unread messages.
     """
+    # Said rather than silently clamped (2026-10-22 test run): a caller asking
+    # for page -5 or for 0 chats has a bug worth knowing about.
+    if offset < 0:
+        raise ValueError(f"offset no puede ser negativo (recibi {offset}); la primera pagina es offset=0")
+    if limit < 1:
+        raise ValueError(f"limit debe ser al menos 1 (recibi {limit}); el maximo es 200")
     start = time.time()
     params = {"limit": min(limit, 200), "offset": offset, "unread_only": str(unread_only).lower()}
     try:
