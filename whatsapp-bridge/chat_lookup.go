@@ -105,7 +105,34 @@ func (s *Server) chatsPage(ctx context.Context, where string, args []any, offset
 		}
 	}
 	s.fillMerged(ctx, page)
+	s.nameUnnamedChats(ctx, page)
+	for i := range page {
+		if label := friendlyMarker(page[i].LastMessagePreview); label != "" {
+			page[i].LastMessagePreview = label
+		}
+	}
 	return page, nil
+}
+
+// nameUnnamedChats gives a direct chat known only by its number — often an
+// @lid's, "99990000002312" (2026-10-23 test run) — the name senderNames finds
+// for that person: their name under any of their JIDs, else their phone.
+func (s *Server) nameUnnamedChats(ctx context.Context, page []chatRow) {
+	var unnamed []string
+	for _, c := range page {
+		if c.ChatType == "direct" && isUnnamed(c.Name) {
+			unnamed = append(unnamed, c.JID)
+		}
+	}
+	if len(unnamed) == 0 {
+		return
+	}
+	names := s.senderNames(ctx, unnamed)
+	for i, c := range page {
+		if name := names[c.JID]; name != "" && c.ChatType == "direct" && isUnnamed(c.Name) {
+			page[i].Name = name
+		}
+	}
 }
 
 // fillMerged completes each listed person with the chat rows they have under
@@ -318,6 +345,10 @@ func (s *Server) senderNames(ctx context.Context, jids []string) map[string]stri
 			}
 		}
 		switch {
+		case strings.HasSuffix(j, "@"+types.GroupServer):
+			// Stored with the group as the sender: history from before the
+			// sender was read correctly (historySender). Nobody to name.
+			names[j] = "Participante desconocido"
 		case name != "":
 			names[j] = name
 		case phone != "":

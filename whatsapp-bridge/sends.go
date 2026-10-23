@@ -704,6 +704,29 @@ func (t *sendTicket) sent(sentAt time.Time) {
 	t.decision = sendDecision{}
 }
 
+// recordSendInChat moves a chat up with what was just sent to it, as a
+// message received does. Sends used to leave the chat's time and preview
+// where they were: on 2026-10-23 the user's own chat still showed an older
+// file after ten sends. It also creates the row for a first message to
+// someone, which the sent message's own row needs.
+// chatJID is the draft's recipient exactly as the message row stores it.
+func (s *Server) recordSendInChat(ctx context.Context, chatJID string, recipient types.JID, msg *waE2E.Message, id string, sentAt int64, text string) error {
+	if hiddenFromChatPreview(msg) {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO chats (jid, chat_type, created_at, updated_at, last_message_id, last_message_time, last_message_preview)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			last_message_id      = excluded.last_message_id,
+			last_message_time    = excluded.last_message_time,
+			last_message_preview = excluded.last_message_preview,
+			updated_at           = excluded.updated_at
+		WHERE COALESCE(chats.last_message_time, 0) <= excluded.last_message_time`,
+		chatJID, chatTypeFromJID(recipient), sentAt, sentAt, id, sentAt, truncate(text, 120))
+	return err
+}
+
 // sendTimeoutNotice is stored on a send whose outcome WhatsApp never
 // confirmed. It may have arrived, so the reader is told to look before
 // sending again.
@@ -969,6 +992,10 @@ func (s *Server) commitSend(ctx context.Context, draftID string, recipient types
 	persistText, persistType := extractContentFromProto(msg)
 	mfields, _ := extractDownloadableFieldsFromProto(msg)
 	scrubbed, flags := Scrub(persistText)
+
+	if err := s.recordSendInChat(persistCtx, recipientJID, recipient, msg, whatsappID, sentAt, persistText); err != nil {
+		log.Printf("draft %s: sent, but updating its chat failed: %v", draftID, err)
+	}
 	_, err = s.db.ExecContext(persistCtx, `
 		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
 			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, media_filename)

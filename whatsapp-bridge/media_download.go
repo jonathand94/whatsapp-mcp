@@ -744,7 +744,7 @@ func downloadErrorBody(err error) errorResponse {
 		return errorResponse{Error: err.Error()}
 	case http.StatusGone:
 		return errorResponse{
-			Error:   "media no longer available",
+			Error:   "archivo no recuperable",
 			Details: err.Error() + ". Pidele a quien lo envio que lo mande otra vez.",
 		}
 	case http.StatusServiceUnavailable:
@@ -752,16 +752,16 @@ func downloadErrorBody(err error) errorResponse {
 		if strings.Contains(err.Error(), "con internet") {
 			next = ". Vuelve a intentarlo en unos minutos."
 		}
-		return errorResponse{Error: "phone did not supply the media", Details: err.Error() + next}
+		return errorResponse{Error: "el telefono no respondio", Details: err.Error() + next}
 	default:
 		if isMismatchedMedia(err) {
 			// whatsmeow's words ("invalid media hmac") tell a person nothing,
 			// and the cause may be the transfer rather than the file.
-			return errorResponse{Error: "download failed", Details: "el archivo que llego de WhatsApp no paso la " +
+			return errorResponse{Error: "la descarga fallo", Details: "el archivo que llego de WhatsApp no paso la " +
 				"verificacion (pudo danarse en el camino); vuelve a intentarlo. Si sigue fallando, pidele a quien " +
 				"lo envio que lo mande otra vez"}
 		}
-		return errorResponse{Error: "download failed", Details: err.Error()}
+		return errorResponse{Error: "la descarga fallo", Details: err.Error()}
 	}
 }
 

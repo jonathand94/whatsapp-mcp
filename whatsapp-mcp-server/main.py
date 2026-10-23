@@ -540,6 +540,8 @@ async def list_messages(
         from_me: True for only the user's own messages, False for only the
                  other side's.
     """
+    if limit < 1:
+        raise ValueError(f"limit debe ser al menos 1 (recibi {limit}); el maximo es 500")
     start = time.time()
     params: dict[str, Any] = {"chat_jid": chat_jid, "limit": min(limit, 500)}
     if before:

@@ -45,6 +45,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -129,13 +130,7 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			ts := int64(wm.GetMessageTimestamp())
 			fromMe := key.GetFromMe()
 
-			senderJID := chatJID
-			switch {
-			case fromMe:
-				senderJID = ownJID
-			case key.GetParticipant() != "":
-				senderJID = key.GetParticipant()
-			}
+			senderJID := historySender(chatJID, ownJID, wm)
 			senderDisplay := wm.GetPushName()
 			if senderDisplay == "" {
 				senderDisplay = senderJID
@@ -171,6 +166,10 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				}
 				if n, _ := res.RowsAffected(); n > 0 {
 					inserted += int(n)
+				} else if senderJID != chatJID && !fromMe {
+					if err := b.repairGroupSender(key.GetID(), chatJID, senderJID, senderDisplay); err != nil {
+						log.Printf("history_sync: sender repair %s failed: %v", key.GetID(), err)
+					}
 				}
 			}
 
@@ -246,6 +245,40 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 	}
 	log.Printf("history_sync: scanned %d msgs across %d conversations (progress=%d), inserted %d new, saw %d media-bearing, backfilled %d media rows, re-decoded %d empty rows",
 		scanned, len(convs), chunk.GetProgress(), inserted, mediaSeen, updated, decoded)
+}
+
+// historySender is who sent a history message, worked out the way whatsmeow
+// does for live ones (ParseWebMessage): the user; in a direct chat, the chat;
+// in a group, the message's participant, which history sync carries on the
+// message itself more often than in its key. Reading only the key, a group's
+// history was filed as sent by the group (130 of 200 messages in one group
+// on 2026-10-23), so its senders merged into one "unknown", and asking the
+// phone for those messages' media named the wrong sender and got no answer.
+// The chat is still the answer when nothing names anyone.
+func historySender(chatJID, ownJID string, wm *waWeb.WebMessageInfo) string {
+	key := wm.GetKey()
+	switch {
+	case key.GetFromMe():
+		return ownJID
+	case !strings.HasSuffix(chatJID, "@"+types.GroupServer) && !strings.HasSuffix(chatJID, "@"+types.BroadcastServer):
+		return chatJID
+	case wm.GetParticipant() != "":
+		return wm.GetParticipant()
+	case key.GetParticipant() != "":
+		return key.GetParticipant()
+	}
+	return chatJID
+}
+
+// repairGroupSender names the sender of a stored group message that was filed
+// as sent by the group itself (see historySender), now that a delivery says
+// who it was. Only such rows change.
+func (b *Bridge) repairGroupSender(id, chatJID, senderJID, senderDisplay string) error {
+	_, err := b.db.Exec(`
+		UPDATE messages SET sender_jid = ?, sender_display = ?
+		 WHERE id = ? AND chat_jid = ? AND sender_jid = chat_jid`,
+		senderJID, senderDisplay, id, chatJID)
+	return err
 }
 
 // newestForChatList picks the message a history chunk sorts and previews its

@@ -543,6 +543,10 @@ type messageRow struct {
 	Filename string `json:"filename,omitempty"`
 	Mime     string `json:"mime,omitempty"`
 	Size     int64  `json:"size,omitempty"`
+	// RawMarker is the stored "[unsupported: …]" marker of a message saved
+	// before the decoder could read its type; ContentText then says in words
+	// what it was (friendlyMarker).
+	RawMarker string `json:"raw_marker,omitempty"`
 }
 
 // mediaTypeFilters are the values list_messages accepts for media_type.
@@ -691,6 +695,9 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		m.IsFromMe = fromMe == 1
+		if label := friendlyMarker(m.ContentText); label != "" {
+			m.RawMarker, m.ContentText = m.ContentText, label
+		}
 		// One chat, one JID: a merged chat's older messages are stored under
 		// its other form (the @lid), and a caller saw two chat_jids in one
 		// answer (2026-10-22 test run). They answer for the chat asked about.

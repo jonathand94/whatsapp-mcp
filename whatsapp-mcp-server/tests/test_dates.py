@@ -49,3 +49,5 @@ def test_list_chats_refuses_impossible_pages():
         asyncio.run(main.list_chats(offset=-5))
     with pytest.raises(ValueError, match="limit"):
         asyncio.run(main.list_chats(limit=0))
+    with pytest.raises(ValueError, match="limit"):
+        asyncio.run(main.list_messages(chat_jid="5215550000001@s.whatsapp.net", limit=0))

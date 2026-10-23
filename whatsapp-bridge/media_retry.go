@@ -193,8 +193,12 @@ func messageInfoForRetry(id, chatJID, senderJID string, fromMe bool) (*types.Mes
 			info.Sender = sender
 		}
 	}
-	if info.IsGroup && info.Sender.IsEmpty() {
-		return nil, fmt.Errorf("message %s in %s has no sender to name in the retry", id, chatJID)
+	// A group message stored with the group as its sender (history from
+	// before 2026-10-23, see historySender) cannot name the participant the
+	// phone needs, and a receipt without it is silently ignored: say so now
+	// rather than after waiting two minutes for an answer that cannot come.
+	if info.IsGroup && (info.Sender.IsEmpty() || info.Sender.ToNonAD() == chat.ToNonAD()) {
+		return nil, fmt.Errorf("el historial no dice quien envio este mensaje en el grupo")
 	}
 	return info, nil
 }

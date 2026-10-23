@@ -13,6 +13,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // hiddenMarkerTypes are the message types whose stored markers are hidden:
@@ -54,4 +55,52 @@ func hiddenMarkerSQL(col string) string {
 func hiddenRowsSQL() string {
 	return "NOT ((type = 'system' AND (COALESCE(content_text, '') = '' OR " + hiddenMarkerSQL("content_text") + "))" +
 		" OR (type = 'reaction' AND COALESCE(content_text, '') = ''))"
+}
+
+// legacyMarkerLabels say what a stored marker was, for types the decoder reads
+// today. Rows stored before it did keep their marker until history delivers
+// the message again (backfillDecodedContent); until then a reader sees what
+// kind of message it was instead of "[unsupported: albumMessage]", which the
+// 2026-10-23 test run still found in the user's own chat.
+var legacyMarkerLabels = map[string]string{
+	"albumMessage":               "Álbum de fotos o videos",
+	"associatedChildMessage":     "Foto o video de un álbum",
+	"templateMessage":            "Mensaje de plantilla de una empresa",
+	"templateButtonReplyMessage": "Respuesta a un botón de una empresa",
+	"buttonsMessage":             "Mensaje con botones de una empresa",
+	"buttonsResponseMessage":     "Respuesta a un botón",
+	"listMessage":                "Mensaje con lista de opciones",
+	"listResponseMessage":        "Respuesta a una lista de opciones",
+	"interactiveMessage":         "Mensaje interactivo de una empresa",
+	"interactiveResponseMessage": "Respuesta a un mensaje interactivo",
+	"pollCreationMessage":        "Encuesta",
+	"pollCreationMessageV2":      "Encuesta",
+	"pollCreationMessageV3":      "Encuesta",
+	"pollCreationMessageV5":      "Encuesta",
+	"pollCreationMessageV6":      "Encuesta",
+	"liveLocationMessage":        "Ubicación en tiempo real",
+	"contactsArrayMessage":       "Varios contactos",
+	"encCommentMessage":          "Comentario cifrado en un anuncio de comunidad",
+	"eventMessage":               "Evento",
+	"groupInviteMessage":         "Invitación a un grupo",
+	"ptvMessage":                 "Videomensaje",
+}
+
+// friendlyMarker is the text shown for a stored marker whose every field has
+// a label, or "" for anything else (real text, a marker of a type still
+// unknown, which keeps its marker).
+func friendlyMarker(text string) string {
+	raw := unsupportedRawType(text)
+	if raw == "" {
+		return ""
+	}
+	var labels []string
+	for _, name := range strings.Split(raw, ",") {
+		label, ok := legacyMarkerLabels[strings.TrimSpace(name)]
+		if !ok {
+			return ""
+		}
+		labels = append(labels, label)
+	}
+	return "[" + strings.Join(labels, "; ") + ": mensaje antiguo, su contenido no se guardó]"
 }
