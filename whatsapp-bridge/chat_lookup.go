@@ -105,32 +105,43 @@ func (s *Server) chatsPage(ctx context.Context, where string, args []any, offset
 		}
 	}
 	s.fillMerged(ctx, page)
-	s.nameUnnamedChats(ctx, page)
-	for i := range page {
-		if label := friendlyMarker(page[i].LastMessagePreview); label != "" {
-			page[i].LastMessagePreview = label
-		}
-	}
+	s.presentChats(ctx, page)
 	return page, nil
 }
 
-// nameUnnamedChats gives a direct chat known only by its number — often an
-// @lid's, "99990000002312" (2026-10-23 test run) — the name senderNames finds
-// for that person: their name under any of their JIDs, else their phone.
-func (s *Server) nameUnnamedChats(ctx context.Context, page []chatRow) {
+// presentChats readies chat rows for a reader, wherever they are listed
+// (list_chats, search_chats, the chat list_messages answers for): a direct
+// chat known only by its number — often an @lid's, "99990000002312" — gets
+// the name senderNames finds for that person; WhatsApp's status updates and
+// unnamed broadcast lists get names that say what they are; and a preview
+// that is an old marker says what the message was.
+func (s *Server) presentChats(ctx context.Context, page []chatRow) {
 	var unnamed []string
 	for _, c := range page {
 		if c.ChatType == "direct" && isUnnamed(c.Name) {
 			unnamed = append(unnamed, c.JID)
 		}
 	}
-	if len(unnamed) == 0 {
-		return
+	var names map[string]string
+	if len(unnamed) > 0 {
+		names = s.senderNames(ctx, unnamed)
 	}
-	names := s.senderNames(ctx, unnamed)
 	for i, c := range page {
-		if name := names[c.JID]; name != "" && c.ChatType == "direct" && isUnnamed(c.Name) {
-			page[i].Name = name
+		switch {
+		case c.ChatType == "direct" && isUnnamed(c.Name) && names[c.JID] != "":
+			page[i].Name = names[c.JID]
+		case c.JID == types.StatusBroadcastJID.String():
+			// It carried the name of whoever posted a status (2026-10-23).
+			page[i].Name = "Estados"
+		case c.ChatType == "broadcast" && isUnnamed(c.Name):
+			user, _, _ := strings.Cut(c.JID, "@")
+			if len(user) > 4 {
+				user = user[len(user)-4:]
+			}
+			page[i].Name = "Lista de difusión (…" + user + ")"
+		}
+		if label := friendlyMarker(c.LastMessagePreview); label != "" {
+			page[i].LastMessagePreview = label
 		}
 	}
 }

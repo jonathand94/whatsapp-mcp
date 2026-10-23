@@ -176,3 +176,47 @@ func TestListsSpeakInWords(t *testing.T) {
 		t.Fatalf("message = %+v", m)
 	}
 }
+
+// TestEveryListShowsAChatTheSameWay: list_messages' chat had the raw marker
+// and an empty name where list_chats had words; status updates carried a
+// person's name and broadcast lists none (2026-10-23 test run).
+func TestEveryListShowsAChatTheSameWay(t *testing.T) {
+	s, db := newMediaTestServer(t)
+	const lid, phone = "99994319150301@lid", "5215550000888@s.whatsapp.net"
+	seedChatAt(t, db, lid, "direct", "", 500, 0)
+	aliasPair(t, db, lid, phone)
+	if _, err := db.Exec(`UPDATE chats SET last_message_preview = '[unsupported: placeholderMessage]' WHERE jid = ?`, lid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, is_from_me)
+		VALUES ('PH', ?, ?, '', 500, 'system', '[unsupported: placeholderMessage]', 0)`, lid, lid); err != nil {
+		t.Fatal(err)
+	}
+	seedChatAt(t, db, "status@broadcast", "broadcast", "Juan Pérez", 400, 0)
+	seedChatAt(t, db, "9990075301@broadcast", "broadcast", "", 300, 0)
+
+	rec := httptest.NewRecorder()
+	s.handleListMessages(rec, httptest.NewRequest(http.MethodGet, "/api/messages?chat_jid="+lid, nil))
+	var out messageListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.Chat == nil {
+		t.Fatalf("%v: %s", err, rec.Body)
+	}
+	listed := getChats(t, s, s.handleListChats, "/api/chats?limit=10")
+	var fromList chatRow
+	byJID := map[string]chatRow{}
+	for _, c := range listed.Chats {
+		byJID[c.JID] = c
+		if c.JID == lid {
+			fromList = c
+		}
+	}
+	if out.Chat.Name != "+5215550000888" || out.Chat.Name != fromList.Name ||
+		out.Chat.LastMessagePreview != fromList.LastMessagePreview ||
+		out.Chat.LastMessagePreview != "[Mensaje que WhatsApp solo muestra en el teléfono]" {
+		t.Fatalf("list_messages chat %+v vs list_chats %+v", *out.Chat, fromList)
+	}
+	if byJID["status@broadcast"].Name != "Estados" || byJID["9990075301@broadcast"].Name != "Lista de difusión (…5301)" {
+		t.Fatalf("broadcasts named %q and %q", byJID["status@broadcast"].Name, byJID["9990075301@broadcast"].Name)
+	}
+}

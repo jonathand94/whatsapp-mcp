@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The chat `list_messages` answers for is shown the way `list_chats` shows it (names from all of the person's JIDs, previews in words); WhatsApp's status updates are named "Estados" instead of whoever posted one, unnamed broadcast lists "Lista de difusión (…NNNN)", and "[unsupported: placeholderMessage]" reads as a message WhatsApp only shows on the phone (2026-10-23 test run).
+
 - **History filed group messages as sent by the group itself** (130 of 200 in one group, 2026-10-23 test run): the sender was read only from the message key, while history sync usually carries it on the message, which is where whatsmeow reads it. Group senders now come out right, rows stored the old way are repaired when history delivers them again, and until then they read "Participante desconocido". Asking the phone for such a message's media named the group as the sender and was silently ignored for two minutes; it is now refused at once, with the reason.
 - **Sending did not move the chat**: its time and preview stayed on the last message received. A send now updates them, and creates the chat for a first message to someone.
 - Direct chats known only by a number get the person's name or phone; old markers of types the decoder now reads ("[unsupported: albumMessage]") read as what they were, with the marker kept under `raw_marker`; download errors are labelled in Spanish; `list_messages` refuses a limit under 1.

@@ -605,6 +605,16 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		_ = s.db.QueryRowContext(r.Context(), query, args...).Scan(
 			&chat.JID, &chat.ChatType, &chat.Name, &chat.LastMessageTime, &chat.LastMessagePreview, &chat.UnreadCount,
 		)
+		// Shown the way list_chats shows it: names and unread counts from
+		// all of the person's JIDs, and the same names and previews
+		// (2026-10-23 test run: a raw marker and an empty name here, where
+		// list_chats had words).
+		if chat.JID != "" {
+			one := []chatRow{chat}
+			s.fillMerged(r.Context(), one)
+			s.presentChats(r.Context(), one)
+			chat = one[0]
+		}
 	}
 
 	// Keyset pagination. `before` is a message ID; return messages strictly
