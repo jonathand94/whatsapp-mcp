@@ -268,6 +268,15 @@ func mergeContacts(ctx context.Context, db *sql.DB, rows []contactRow) []contact
 // any of their JIDs, else their phone number, else "Desconocido". A bare @lid
 // number ("99990000002312") means nothing to a reader (2026-10-22 test run).
 func (s *Server) senderNames(ctx context.Context, jids []string) map[string]string {
+	seen := map[string]bool{}
+	unique := jids[:0:0]
+	for _, j := range jids {
+		if !seen[j] {
+			seen[j] = true
+			unique = append(unique, j)
+		}
+	}
+	jids = unique
 	keys, members, _ := aliasGroups(ctx, s.db, jids)
 	var all []string
 	for _, j := range jids {
@@ -314,10 +323,27 @@ func (s *Server) senderNames(ctx context.Context, jids []string) map[string]stri
 		case phone != "":
 			names[j] = "+" + strings.TrimPrefix(phone, "+")
 		default:
-			names[j] = "Desconocido"
+			// The end of the number tells two unknown senders apart.
+			user, _, _ := strings.Cut(j, "@")
+			if len(user) > 4 {
+				user = user[len(user)-4:]
+			}
+			names[j] = "Desconocido (…" + user + ")"
 		}
 	}
 	return names
+}
+
+// isUnnamed reports whether a stored sender label is no name at all: empty, a
+// bare number, or a JID — history sync stores "900000000000001@lid" when the
+// sender has no push name, live receive stores the number.
+func isUnnamed(display string) bool {
+	if isBareNumber(display) {
+		return true
+	}
+	user, _, found := strings.Cut(display, "@")
+	user, _, _ = strings.Cut(user, ":")
+	return found && user != "" && isBareNumber(user)
 }
 
 // ownDisplayName is how the user's own messages are labelled: their WhatsApp

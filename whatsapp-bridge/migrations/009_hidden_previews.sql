@@ -9,8 +9,8 @@
 -- have something to show, the way migration 008 does, and sorts them by it. A
 -- chat with no such message gets no time, which sorts it last.
 --
--- The markers listed here are hiddenMarkers in chat_preview_repair.go; a test
--- keeps the two lists equal.
+-- The marker conditions are hiddenMarkerSQL in chat_preview_repair.go (a test
+-- keeps them equal): a marker is hidden when every field it names is.
 
 UPDATE chats
    SET (last_message_id, last_message_time, last_message_preview) = (
@@ -21,28 +21,12 @@ UPDATE chats
            FROM messages m
           WHERE m.chat_jid = chats.jid
             AND m.timestamp <= CAST(strftime('%s', 'now') AS INTEGER) + 86400
-            AND NOT (m.type = 'system' AND (COALESCE(m.content_text, '') = '' OR m.content_text IN (
-                  '[unsupported: protocolMessage]',
-                  '[unsupported: pollUpdateMessage]',
-                  '[unsupported: encReactionMessage]',
-                  '[unsupported: encEventResponseMessage]',
-                  '[unsupported: secretEncryptedMessage]',
-                  '[unsupported: fastRatchetKeySenderKeyDistributionMessage]',
-                  '[unsupported: groupRootKeyShare]',
-                  '[unsupported: rootSecretDistributeMessage]',
-                  '[unsupported: stickerSyncRmrMessage]')))
+            AND NOT (m.type = 'system' AND (COALESCE(m.content_text, '') = '' OR
+                     (m.content_text LIKE '[unsupported: %' AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(m.content_text, 'fastRatchetKeySenderKeyDistributionMessage', ''), 'rootSecretDistributeMessage', ''), 'encEventResponseMessage', ''), 'secretEncryptedMessage', ''), 'stickerSyncRmrMessage', ''), 'encReactionMessage', ''), 'pollUpdateMessage', ''), 'groupRootKeyShare', ''), 'protocolMessage', ''), ',', '') = '[unsupported: ]')))
+            AND NOT (m.type = 'reaction' AND COALESCE(m.content_text, '') = '')
           ORDER BY m.timestamp DESC
           LIMIT 1)
- WHERE last_message_preview IN (
-         '[unsupported: protocolMessage]',
-         '[unsupported: pollUpdateMessage]',
-         '[unsupported: encReactionMessage]',
-         '[unsupported: encEventResponseMessage]',
-         '[unsupported: secretEncryptedMessage]',
-         '[unsupported: fastRatchetKeySenderKeyDistributionMessage]',
-         '[unsupported: groupRootKeyShare]',
-         '[unsupported: rootSecretDistributeMessage]',
-         '[unsupported: stickerSyncRmrMessage]');
+ WHERE (last_message_preview LIKE '[unsupported: %' AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(last_message_preview, 'fastRatchetKeySenderKeyDistributionMessage', ''), 'rootSecretDistributeMessage', ''), 'encEventResponseMessage', ''), 'secretEncryptedMessage', ''), 'stickerSyncRmrMessage', ''), 'encReactionMessage', ''), 'pollUpdateMessage', ''), 'groupRootKeyShare', ''), 'protocolMessage', ''), ',', '') = '[unsupported: ]');
 
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (9, strftime('%s', 'now'), 'chats: previews no longer point at hidden messages');

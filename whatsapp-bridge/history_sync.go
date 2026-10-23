@@ -444,25 +444,33 @@ func (b *Bridge) RequestHistoryBefore(ctx context.Context, chatJID, anchorID str
 
 // --- MYC-3284 content backfill ---------------------------------------------
 
+// mediaTypes are the message types that are complete without any text.
+var mediaTypes = map[string]bool{"image": true, "video": true, "audio": true, "voice": true,
+	"document": true, "sticker": true}
+
 // backfillDecodedContent re-decodes one history-sync message and repairs the
-// stored row if — and only if — that row was written empty by the pre-MYC-3284
-// decoder.
+// stored row when an older decoder could not read it.
 //
-// The WHERE clause is the entire safety argument, so it is worth stating
-// plainly. A row is eligible only when BOTH hold:
+// The rows it may rewrite are the entire safety argument, so they are stated
+// plainly. The row must still be type 'system', and its text one of:
 //
-//	type = 'system'                          the old catch-all bucket
-//	content_text IS NULL OR content_text=''  it actually has no payload
+//	''                       written empty by the pre-MYC-3284 decoder
+//	'[unsupported: X]'       a marker, and the message delivered now carries
+//	                         field X and decodes to something that is not a
+//	                         marker (since 2026-10-22)
+//	'[undecryptable: ...]'   a message that could not be decrypted on arrival
 //
-// So this can only ever turn a blank into something. It cannot overwrite text,
-// cannot touch a media row, and cannot disturb a row the current decoder wrote
-// (those carry either real text or an "[unsupported: …]" marker, and a marker
-// is non-empty). Overlapping history chunks are therefore idempotent, and a
+// and the UPDATE only lands if that text is still what was read (a compare
+// and swap on the primary key). So it never overwrites text a person wrote,
+// never touches a media row or any other system row (album summaries, group
+// events), and cannot take another message's text: the field check ties the
+// delivery to the marker. Overlapping history chunks are idempotent, and a
 // stale re-delivery cannot clobber a fresher live row.
 //
-// A genuinely textless protocol carrier re-decodes to ("", "system") and the
-// UPDATE is a no-op write of identical values, which is the correct outcome:
-// key-distribution rows stay silent rather than gaining vault noise.
+// A textless delivery changes nothing, except media, whose type is itself
+// what was missing: a photo with no caption becomes an image row. A withdrawn
+// reaction or an empty text is left a hidden blank instead of becoming a
+// visible empty row.
 func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, error) {
 	if msgID == "" || m == nil {
 		return 0, nil
@@ -472,17 +480,22 @@ func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, er
 	// backfilled row is byte-identical to what it would have been had the
 	// message arrived today.
 	text, msgType := extractContentFromProto(m)
-	if text == "" && msgType == "system" {
+	if text == "" && !mediaTypes[msgType] {
 		// Nothing recovered — leave the row exactly as it is rather than
 		// rewriting it with the same emptiness. A photo or voice note with no
-		// caption is something recovered: its type.
+		// caption is something recovered: its type. An empty reaction (one
+		// that was withdrawn) or an empty text is not, and would only turn a
+		// hidden row into a visible blank one.
 		return 0, nil
 	}
-	// A row stored as a marker by a decoder that did not know its type yet
-	// (6,798 of them on 2026-10-22: templates, albums and their photos,
-	// polls...) is re-decoded too — but only when the new answer is not a
-	// marker again, and the message delivered now really carries the type
-	// the marker names, so text from any other message can never land there.
+
+	// Which stored rows may be rewritten, and only these: rows left blank
+	// before the decoder could read them; markers of a type the decoder did
+	// not know yet (6,798 of them on 2026-10-22: templates, albums and their
+	// photos, polls...), when the message delivered now really carries the
+	// field the marker names and does not decode to a marker again; and
+	// placeholders of messages that could not be decrypted when they arrived.
+	// Any other system row (an album summary, a group event) is left alone.
 	var stored string
 	if err := b.db.QueryRow(`SELECT COALESCE(content_text, '') FROM messages WHERE id = ? AND type = 'system'`,
 		msgID).Scan(&stored); err != nil {
@@ -491,9 +504,18 @@ func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, er
 		}
 		return 0, err
 	}
-	if raw := unsupportedRawType(stored); raw != "" &&
-		(unsupportedRawType(text) != "" || !carriesFields(m, strings.Split(raw, ","))) {
+	switch raw := unsupportedRawType(stored); {
+	case stored == "":
+	case raw != "":
+		if unsupportedRawType(text) != "" || !carriesFields(m, strings.Split(raw, ",")) {
+			return 0, nil
+		}
+	case undecryptableFailMode(stored) != "":
+	default:
 		return 0, nil
+	}
+	if text == stored && msgType == "system" {
+		return 0, nil // already what it would be
 	}
 
 	scrubbed, flags := Scrub(text)

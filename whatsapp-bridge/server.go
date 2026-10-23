@@ -629,9 +629,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	// isPlumbing) are blank, and markers of messages with nothing to read
 	// ("[unsupported: protocolMessage]", 3,120 of them by 2026-10-22) are
 	// noise: both stay in the database but are not shown (chat_preview_repair.go).
-	hidden, hiddenArgs := hiddenRowsSQL()
-	where += " AND " + hidden
-	args = append(args, hiddenArgs...)
+	where += " AND " + hiddenRowsSQL()
 
 	// Filters, so finding an attachment does not mean paging through a chat:
 	// media_type (see mediaTypeFilters), since/until (unix seconds, inclusive)
@@ -700,9 +698,9 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		// The user's own messages synced from the phone often carry no push
 		// name, and were shown as a bare number ("99990069399676"). They are
 		// the user's; say so.
-		if m.IsFromMe && isBareNumber(m.SenderDisplay) {
+		if m.IsFromMe && isUnnamed(m.SenderDisplay) {
 			m.SenderDisplay = ownName
-		} else if isBareNumber(m.SenderDisplay) && m.SenderJID != "" {
+		} else if isUnnamed(m.SenderDisplay) && m.SenderJID != "" {
 			unnamed = append(unnamed, nonADJID(m.SenderJID))
 		}
 		out.Messages = append(out.Messages, m)
@@ -710,7 +708,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	if len(unnamed) > 0 {
 		names := s.senderNames(r.Context(), unnamed)
 		for i, m := range out.Messages {
-			if name, ok := names[nonADJID(m.SenderJID)]; ok && !m.IsFromMe && isBareNumber(m.SenderDisplay) {
+			if name, ok := names[nonADJID(m.SenderJID)]; ok && !m.IsFromMe && isUnnamed(m.SenderDisplay) {
 				out.Messages[i].SenderDisplay = name
 			}
 		}

@@ -162,12 +162,12 @@ func extractDownloadableFieldsFromProto(m *waE2E.Message) (mediaFields, bool) {
 
 // errMediaGone marks a download that failed for good: WhatsApp's CDN no
 // longer has the file and the phone does not have it either.
-var errMediaGone = errors.New("WhatsApp ya no tiene este archivo en su servidor")
+var errMediaGone = errors.New("no se puede recuperar el archivo")
 
 // errPhoneUnreachable marks a download WhatsApp's CDN could not serve and the
 // phone did not supply this time — offline, slow, or the request did not get
 // through. Unlike errMediaGone it is worth trying again later.
-var errPhoneUnreachable = errors.New("WhatsApp ya no tiene este archivo en su servidor y el telefono no lo entrego")
+var errPhoneUnreachable = errors.New("el telefono no entrego el archivo")
 
 // downloadAttempts is how many times a download that fails is started over
 // from an empty file. whatsmeow retries network errors itself, but from the
@@ -298,14 +298,14 @@ func (b *Bridge) DownloadMediaFile(ctx context.Context, messageID string, job *m
 		job.setPhase(why + "; pidiendoselo al telefono")
 		info, ierr := messageInfoForRetry(messageID, chatJID, senderJID, isFromMe == 1)
 		if ierr != nil {
-			return resp, fmt.Errorf("%w: %s, y no se puede pedir al telefono: %v", errMediaGone, why, ierr)
+			return resp, fmt.Errorf("%w: %s y no se le puede pedir al telefono (%v)", errMediaGone, why, ierr)
 		}
 		newPath, rerr := b.requestMediaReupload(ctx, info, mediaKey)
 		if errors.Is(rerr, errNotOnPhone) {
-			return resp, fmt.Errorf("%w: %s, y %v", errMediaGone, why, rerr)
+			return resp, fmt.Errorf("%w: %s y el telefono ya no lo tiene", errMediaGone, why)
 		}
 		if rerr != nil {
-			return resp, fmt.Errorf("%w: %s, y %v", errPhoneUnreachable, why, rerr)
+			return resp, fmt.Errorf("%w: %s y %v", errPhoneUnreachable, why, rerr)
 		}
 		// Recorded straight away, so if the second attempt fails for some
 		// unrelated reason the next one starts from the fresh path instead of
@@ -324,9 +324,12 @@ func (b *Bridge) DownloadMediaFile(ctx context.Context, messageID string, job *m
 		job.setPhase("descargando de WhatsApp")
 		err = b.downloadWithRetries(ctx, dl, part, written, job)
 		resp.RecoveredFromPhone = err == nil
-		if isMismatchedMedia(err) {
+		if errors.Is(err, whatsmeow.ErrInvalidMediaEncSHA256) {
 			err = fmt.Errorf("%w: la copia que el telefono volvio a subir tampoco coincide con la del mensaje", errMediaGone)
 		}
+	}
+	if errors.Is(err, errMediaGone) || errors.Is(err, errPhoneUnreachable) {
+		return resp, err // already in words a person can act on
 	}
 	if err != nil {
 		return resp, fmt.Errorf("whatsmeow download: %w", err)
@@ -382,7 +385,7 @@ func (b *Bridge) downloadWithRetries(ctx context.Context, dl whatsmeow.Downloada
 	var err error
 	for attempt := 1; attempt <= downloadAttempts; attempt++ {
 		err = b.downloadToFile(ctx, dl, path, written)
-		if err == nil || isExpiredMedia(err) || ctx.Err() != nil || errors.Is(err, whatsmeow.ErrNoURLPresent) {
+		if err == nil || isGoneFromCDN(err) || ctx.Err() != nil || errors.Is(err, whatsmeow.ErrNoURLPresent) {
 			return err
 		}
 		if attempt < downloadAttempts {
@@ -681,7 +684,9 @@ func (s *Server) handleDownloadMedia(w http.ResponseWriter, r *http.Request) {
 	// caller already got is not repeated; the request after it tries again.
 	if prev := s.jobs().get(key); prev != nil && !prev.running() {
 		s.jobs().forget(key, prev)
-		if !prev.delivered.Swap(true) {
+		// Only a recent one: a "turn on the phone" from an hour ago is no
+		// answer to a request made with the phone on.
+		if time.Since(prev.finished) < failedDownloadReplay && !prev.delivered.Swap(true) {
 			writeJSON(w, prev.status, prev.body)
 			return
 		}
@@ -710,6 +715,10 @@ func (s *Server) handleDownloadMedia(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// failedDownloadReplay is how long a failed download's answer waits for the
+// caller who asked for it (see handleDownloadMedia).
+const failedDownloadReplay = 10 * time.Minute
+
 // downloadErrorStatus keeps the statuses callers already rely on: 404 for a
 // message that has nothing to download, 410 for media WhatsApp no longer has,
 // 500 for everything else.
@@ -720,7 +729,7 @@ func downloadErrorStatus(err error) int {
 		strings.Contains(msg, "media key not available"),
 		strings.Contains(msg, "is not downloadable"):
 		return http.StatusNotFound
-	case errors.Is(err, errMediaGone), isMismatchedMedia(err):
+	case errors.Is(err, errMediaGone):
 		return http.StatusGone
 	case errors.Is(err, errPhoneUnreachable):
 		return http.StatusServiceUnavailable
@@ -734,21 +743,24 @@ func downloadErrorBody(err error) errorResponse {
 	case http.StatusNotFound:
 		return errorResponse{Error: err.Error()}
 	case http.StatusGone:
-		details := err.Error()
-		if !errors.Is(err, errMediaGone) {
-			// whatsmeow's words ("invalid media hmac") tell a person nothing.
-			details = cdnProblem(err)
-		}
 		return errorResponse{
 			Error:   "media no longer available",
-			Details: details + ". Pidele a quien lo envio que lo mande otra vez.",
+			Details: err.Error() + ". Pidele a quien lo envio que lo mande otra vez.",
 		}
 	case http.StatusServiceUnavailable:
-		return errorResponse{
-			Error:   "phone did not supply the media",
-			Details: err.Error() + ". Vuelve a intentarlo con el telefono encendido y con internet.",
+		next := ". Vuelve a intentarlo con el telefono encendido y con internet."
+		if strings.Contains(err.Error(), "con internet") {
+			next = ". Vuelve a intentarlo en unos minutos."
 		}
+		return errorResponse{Error: "phone did not supply the media", Details: err.Error() + next}
 	default:
+		if isMismatchedMedia(err) {
+			// whatsmeow's words ("invalid media hmac") tell a person nothing,
+			// and the cause may be the transfer rather than the file.
+			return errorResponse{Error: "download failed", Details: "el archivo que llego de WhatsApp no paso la " +
+				"verificacion (pudo danarse en el camino); vuelve a intentarlo. Si sigue fallando, pidele a quien " +
+				"lo envio que lo mande otra vez"}
+		}
 		return errorResponse{Error: "download failed", Details: err.Error()}
 	}
 }

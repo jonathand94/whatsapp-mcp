@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -36,6 +36,16 @@ func TestAFailedDownloadIsAnsweredOnce(t *testing.T) {
 	if rec := post(); rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "SENTINEL") {
 		t.Fatalf("the next request should get the failure: %d %s", rec.Code, rec.Body)
 	}
+
+	// A failure from long ago is no answer to a request made now.
+	old, _ := s.jobs().start("download:"+id, func(*mediaJob) (int, any) {
+		return http.StatusServiceUnavailable, errorResponse{Error: "phone did not supply the media", Details: "OLD"}
+	})
+	<-old.done
+	old.finished = old.finished.Add(-time.Hour)
+	if rec := post(); strings.Contains(rec.Body.String(), "OLD") {
+		t.Fatalf("an hour-old failure was replayed: %d %s", rec.Code, rec.Body)
+	}
 	// Handed out once: the request after it tries again (here: the message is
 	// not in the database, so a fresh attempt answers 404).
 	if rec := post(); rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), "SENTINEL") {
@@ -51,11 +61,12 @@ func TestACopyThatDoesNotMatchIsAskedFromThePhone(t *testing.T) {
 	if !isExpiredMedia(cdn) || !isMismatchedMedia(cdn) {
 		t.Fatal("a mismatched copy should go to the phone")
 	}
-	// A MAC that does not fit means the key does not fit: the phone's copy
-	// would not either. Not retried, but said plainly, as a 410.
+	// A MAC or plaintext mismatch can come from the transfer (or from a row
+	// missing its hash): not sent to the phone, not blamed on the sender —
+	// said plainly, with "try again".
 	hmac := fmt.Errorf("whatsmeow download: %w", whatsmeow.ErrInvalidMediaHMAC)
-	if isExpiredMedia(hmac) || downloadErrorStatus(hmac) != http.StatusGone ||
-		!strings.Contains(downloadErrorBody(hmac).Details, "no coincide") {
+	if isExpiredMedia(hmac) || downloadErrorStatus(hmac) != http.StatusInternalServerError ||
+		!strings.Contains(downloadErrorBody(hmac).Details, "vuelve a intentarlo") {
 		t.Fatalf("hmac mismatch: expired=%t %d %+v", isExpiredMedia(hmac), downloadErrorStatus(hmac), downloadErrorBody(hmac))
 	}
 	if got := cdnProblem(cdn); !strings.Contains(got, "no coincide") {
@@ -64,30 +75,51 @@ func TestACopyThatDoesNotMatchIsAskedFromThePhone(t *testing.T) {
 	if got := cdnProblem(whatsmeow.ErrMediaDownloadFailedWith404); !strings.Contains(got, "ya no lo tiene") {
 		t.Fatalf("cdnProblem(404) = %q", got)
 	}
-	err := fmt.Errorf("%w: %s, y %v", errMediaGone, cdnProblem(cdn), errNotOnPhone)
-	if downloadErrorStatus(err) != http.StatusGone || strings.Contains(downloadErrorBody(err).Details, "ciphertext") {
-		t.Fatalf("want a 410 in plain words: %d %+v", downloadErrorStatus(err), downloadErrorBody(err))
+	err := fmt.Errorf("%w: %s y el telefono ya no lo tiene", errMediaGone, cdnProblem(cdn))
+	body := downloadErrorBody(err)
+	if downloadErrorStatus(err) != http.StatusGone || strings.Contains(body.Details, "ciphertext") ||
+		strings.Count(body.Details, "WhatsApp") > 1 {
+		t.Fatalf("want a 410 in plain words, said once: %d %+v", downloadErrorStatus(err), body)
+	}
+	unreachable := fmt.Errorf("%w: %s y el telefono no respondio en 2m0s; tiene que estar encendido y con internet",
+		errPhoneUnreachable, cdnProblem(whatsmeow.ErrMediaDownloadFailedWith404))
+	if d := downloadErrorBody(unreachable).Details; strings.Count(d, "con internet") != 1 {
+		t.Fatalf("the advice is repeated: %q", d)
 	}
 }
 
-// TestHiddenMarkersMatchMigration009 keeps the Go list and the SQL list equal.
+// TestHiddenMarkersMatchMigration009 keeps the migration's conditions equal to
+// the ones list_messages uses.
 func TestHiddenMarkersMatchMigration009(t *testing.T) {
 	raw, err := migrationsFS.ReadFile("migrations/009_hidden_previews.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	inSQL := map[string]int{}
-	for _, m := range regexp.MustCompile(`'\[unsupported: [A-Za-z]+\]'`).FindAllString(string(raw), -1) {
-		inSQL[strings.Trim(m, "'")]++
-	}
-	for _, m := range hiddenMarkers() {
-		if inSQL[m] != 2 { // once for the messages, once for the previews
-			t.Errorf("%s appears %d times in migration 009, want 2", m, inSQL[m])
+	for _, col := range []string{"m.content_text", "last_message_preview"} {
+		if !strings.Contains(string(raw), hiddenMarkerSQL(col)) {
+			t.Errorf("migration 009 does not use hiddenMarkerSQL(%q):\n%s", col, hiddenMarkerSQL(col))
 		}
-		delete(inSQL, m)
 	}
-	if len(inSQL) > 0 {
-		t.Errorf("migration 009 lists markers the bridge does not hide: %v", inSQL)
+}
+
+// TestHiddenMarkerSQL: a marker is hidden when every field it names is.
+func TestHiddenMarkerSQL(t *testing.T) {
+	db := undecodedTestDB(t)
+	for text, hidden := range map[string]bool{
+		"[unsupported: protocolMessage]":                                            true,
+		"[unsupported: fastRatchetKeySenderKeyDistributionMessage,protocolMessage]": true,
+		"[unsupported: pollUpdateMessage,templateMessage]":                          false,
+		"[unsupported: templateMessage]":                                            false,
+		"[unsupported: protocolMessageV2]":                                          false,
+		"hola, protocolMessage":                                                     false,
+	} {
+		var got bool
+		if err := db.QueryRow(`SELECT `+hiddenMarkerSQL("?"), text, text).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != hidden {
+			t.Errorf("%q hidden = %t, want %t", text, got, hidden)
+		}
 	}
 }
 
@@ -99,12 +131,14 @@ func TestMigration009RepointsHiddenPreviews(t *testing.T) {
 	if _, err := db.Exec(`
 		INSERT INTO messages (id, chat_jid, sender_jid, timestamp, type, content_text, is_from_me) VALUES
 		  ('TXT', ?, '', 1792500000, 'text', 'Hola de verdad', 1),
+		  ('UNDO', ?, '', 1792540000, 'reaction', '', 1),
 		  ('REV', ?, '', 1792550000, 'system', '[unsupported: protocolMessage]', 1),
-		  ('OTHER', ?, '', 1792540000, 'text', 'Intacto', 0)`, own, own, other); err != nil {
+		  ('OTHER', ?, '', 1792540000, 'text', 'Intacto', 0)`, own, own, own, other); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE chats SET last_message_id = 'REV', last_message_time = 1792550000,
-		last_message_preview = '[unsupported: protocolMessage]' WHERE jid = ?`, own); err != nil {
+		last_message_preview = '[unsupported: fastRatchetKeySenderKeyDistributionMessage,protocolMessage]'
+		WHERE jid = ?`, own); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE chats SET last_message_id = 'OTHER', last_message_time = 1792540000,
@@ -145,8 +179,10 @@ func TestListMessagesSpeaksForTheChatAskedAbout(t *testing.T) {
 		  ('NEW', ?, ?, 'Ana Torres', 300, 'text', 'reciente', 0),
 		  ('OLD', ?, ?, '900000000000001', 200, 'text', 'antiguo', 0),
 		  ('GONE', ?, ?, '', 250, 'system', '[unsupported: protocolMessage]', 0),
+		  ('UNDO', ?, ?, '', 240, 'reaction', '', 0),
+		  ('HIST', ?, ?, '900000000000001@lid', 180, 'text', 'del historial', 0),
 		  ('WHO', ?, ?, '99990000002312', 150, 'text', 'de un desconocido', 0)`,
-		phone, phone, lid, lid, lid, lid, lid, stranger); err != nil {
+		phone, phone, lid, lid, lid, lid, lid, lid, lid, lid, lid, stranger); err != nil {
 		t.Fatal(err)
 	}
 
@@ -163,13 +199,14 @@ func TestListMessagesSpeaksForTheChatAskedAbout(t *testing.T) {
 			t.Errorf("%s answers for chat %s, want %s", m.ID, m.ChatJID, phone)
 		}
 	}
-	if _, ok := got["GONE"]; ok || len(got) != 3 {
-		t.Fatalf("want NEW, OLD and WHO without the protocol marker, got %v", out.Messages)
+	if _, ok := got["GONE"]; ok || len(got) != 4 {
+		t.Fatalf("want NEW, OLD, HIST and WHO, without the protocol marker or the withdrawn reaction; got %v", out.Messages)
 	}
-	if got["OLD"].SenderDisplay != "Ana Torres" {
-		t.Errorf("a sender known under her other JID shows as %q", got["OLD"].SenderDisplay)
+	if got["OLD"].SenderDisplay != "Ana Torres" || got["HIST"].SenderDisplay != "Ana Torres" {
+		t.Errorf("a sender known under her other JID shows as %q (live) and %q (history)",
+			got["OLD"].SenderDisplay, got["HIST"].SenderDisplay)
 	}
-	if got["WHO"].SenderDisplay != "Desconocido" {
+	if got["WHO"].SenderDisplay != "Desconocido (…2312)" {
 		t.Errorf("an unknown @lid sender shows as %q", got["WHO"].SenderDisplay)
 	}
 }
@@ -206,5 +243,38 @@ func TestHistoryRedecodesOldMarkers(t *testing.T) {
 	}
 	if typ, text := row("NEW"); typ != "system" || text != "[unsupported: someFutureMessage]" {
 		t.Errorf("a marker replaced by another marker: (%s, %q)", typ, text)
+	}
+}
+
+// TestHistoryRewritesOnlyRowsItCouldNotRead: the re-decode leaves every other
+// system row alone, and never turns a hidden blank into a visible empty one.
+func TestHistoryRewritesOnlyRowsItCouldNotRead(t *testing.T) {
+	db := undecodedTestDB(t)
+	b := &Bridge{db: db}
+	const chat = "12147735814-1589465137@g.us"
+	insertTestMessage(t, db, "ALBUM", chat, "system", "Álbum: 3 fotos", 100)
+	insertTestMessage(t, db, "BLANK", chat, "system", "", 101)
+	insertTestMessage(t, db, "LOCKED", chat, "system", undecryptableMarker("decrypt-failed"), 102)
+
+	hola := &waE2E.Message{Conversation: proto.String("hola")}
+	withdrawn := &waE2E.Message{EphemeralMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{
+		ReactionMessage: &waE2E.ReactionMessage{Text: proto.String("")}}}}
+	for id, m := range map[string]*waE2E.Message{"ALBUM": hola, "BLANK": withdrawn, "LOCKED": hola} {
+		if _, err := b.backfillDecodedContent(id, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row := func(id string) (typ, text string) {
+		db.QueryRow(`SELECT type, COALESCE(content_text, '') FROM messages WHERE id = ?`, id).Scan(&typ, &text)
+		return
+	}
+	if typ, text := row("ALBUM"); typ != "system" || text != "Álbum: 3 fotos" {
+		t.Errorf("an album summary was rewritten: (%s, %q)", typ, text)
+	}
+	if typ, text := row("BLANK"); typ != "system" || text != "" {
+		t.Errorf("a withdrawn reaction became a visible row: (%s, %q)", typ, text)
+	}
+	if typ, text := row("LOCKED"); typ != "text" || text != "hola" {
+		t.Errorf("a message history delivered readable is still (%s, %q)", typ, text)
 	}
 }

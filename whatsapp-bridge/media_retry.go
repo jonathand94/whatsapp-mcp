@@ -90,19 +90,24 @@ func (b *Bridge) onMediaRetry(evt *events.MediaRetry) {
 	}
 }
 
-// isExpiredMedia reports whether a download failed because WhatsApp's copy of
-// the file is gone, or is not the file the message describes: the failures a
-// fresh upload from the phone can fix. A copy whose ciphertext hash does not
-// match was what old attachments failed with on 2026-10-22, from every CDN
-// host alike; it is deterministic, so retrying the same copy only wasted time.
-// A MAC or plaintext mismatch is not included: those say the message's own
-// key does not fit, and the phone's copy, encrypted with that key, would not
-// fit either.
-func isExpiredMedia(err error) bool {
+// isGoneFromCDN reports whether WhatsApp's CDN no longer has the file at all:
+// starting the download over cannot help.
+func isGoneFromCDN(err error) bool {
 	return errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
 		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
-		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) ||
-		errors.Is(err, whatsmeow.ErrInvalidMediaEncSHA256)
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410)
+}
+
+// isExpiredMedia reports whether a download failed in a way a fresh upload
+// from the phone can fix: the CDN no longer has the file, or still serves a
+// copy whose ciphertext hash does not match after the download was started
+// over from scratch. That second case is what old attachments failed with on
+// 2026-10-22, from every CDN host alike. A MAC or plaintext mismatch is not
+// included: whatsmeow reports those for a row missing its plaintext hash and
+// for a download that changed hosts mid-file, neither of which the phone's
+// copy would fix.
+func isExpiredMedia(err error) bool {
+	return isGoneFromCDN(err) || errors.Is(err, whatsmeow.ErrInvalidMediaEncSHA256)
 }
 
 // isMismatchedMedia reports whether the bytes WhatsApp served are not the ones

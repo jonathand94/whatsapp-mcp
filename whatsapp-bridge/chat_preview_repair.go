@@ -10,7 +10,10 @@
 
 package main
 
-import "strings"
+import (
+	"fmt"
+	"sort"
+)
 
 // hiddenMarkerTypes are the message types whose stored markers are hidden:
 // previewlessFields, plus encrypted messages, which the bridge cannot read and
@@ -27,19 +30,28 @@ var hiddenMarkerTypes = []string{
 	"stickerSyncRmrMessage",
 }
 
-// hiddenMarkers is the content_text of each hidden type's marker.
-func hiddenMarkers() []string {
-	out := make([]string, len(hiddenMarkerTypes))
-	for i, t := range hiddenMarkerTypes {
-		out[i] = unsupportedMarker(t)
+// hiddenMarkerSQL is an SQL condition true when col holds a marker every one
+// of whose fields is a hidden type: "[unsupported: protocolMessage]" and also
+// "[unsupported: fastRatchetKeySenderKeyDistributionMessage,protocolMessage]".
+// Markers list their fields sorted and comma-joined (unsupportedMessageType),
+// so removing every hidden name and the commas leaves the bare brackets.
+// Longest names go first, so none is cut out of a longer one; a field that
+// is not hidden leaves text behind, and the marker stays visible.
+func hiddenMarkerSQL(col string) string {
+	names := append([]string(nil), hiddenMarkerTypes...)
+	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
+	expr := col
+	for _, n := range names {
+		expr = fmt.Sprintf("REPLACE(%s, '%s', '')", expr, n)
 	}
-	return out
+	return fmt.Sprintf("(%s LIKE '%s%%' AND REPLACE(%s, ',', '') = '%s')",
+		col, unsupportedPrefix, expr, unsupportedPrefix+unsupportedSuffix)
 }
 
-// hiddenRowsSQL is a WHERE condition that leaves out blank system rows and
-// hidden markers, with its arguments.
-func hiddenRowsSQL() (string, []any) {
-	markers := hiddenMarkers()
-	return "NOT (type = 'system' AND (COALESCE(content_text, '') = '' OR content_text IN (" +
-		strings.TrimSuffix(strings.Repeat("?,", len(markers)), ",") + ")))", jidsToArgs(markers)
+// hiddenRowsSQL is a WHERE condition that leaves out rows with nothing to
+// show: blank system rows, hidden markers, and withdrawn reactions (a
+// reaction with no emoji).
+func hiddenRowsSQL() string {
+	return "NOT ((type = 'system' AND (COALESCE(content_text, '') = '' OR " + hiddenMarkerSQL("content_text") + "))" +
+		" OR (type = 'reaction' AND COALESCE(content_text, '') = ''))"
 }
