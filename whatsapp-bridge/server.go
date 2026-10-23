@@ -647,7 +647,7 @@ type contactRow struct {
 	Phone string `json:"phone,omitempty"`
 	// FullName is the name from the USER's address book; PushName is the one
 	// the contact chose for themselves. Both are reported rather than collapsed:
-	// they routinely disagree ("Mi Amor" versus "Dra Ivette De La Vega") and a
+	// they routinely disagree ("Mi Cielo" versus "Dra Laura De La Rosa") and a
 	// caller deciding who to message needs to see the label it was asked about,
 	// not a merged best guess.
 	FullName     string   `json:"full_name,omitempty"`
@@ -684,7 +684,7 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	//
 	// normalized_full_name is searched alongside normalized_name because the
 	// address-book label is usually the only name the user knows. While that
-	// column went unread, searching "Mi Amor" returned zero and the caller was
+	// column went unread, searching "Mi Cielo" returned zero and the caller was
 	// pushed into supplying a phone number from memory — which is exactly the
 	// job an address book exists to do. See contacts_sync.go.
 	rows, err := s.db.QueryContext(r.Context(), `

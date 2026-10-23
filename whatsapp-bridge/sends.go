@@ -556,8 +556,8 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 //     recipient_contact_hit=false, while the information sat one join away.
 //   - It never consulted the address book. verified_name and push_name are what
 //     the CONTACT chose; full_name is what the USER chose, and it is the name
-//     they will recognise. Preferring it means the preview says "Mi Amor" where
-//     the user thinks "Mi Amor".
+//     they will recognise. Preferring it means the preview says "Mi Cielo" where
+//     the user thinks "Mi Cielo".
 func (s *Server) resolveRecipient(ctx context.Context, jid string) (string, bool) {
 	var fullName, pushName, verifiedName, phone sql.NullString
 	err := s.db.QueryRowContext(ctx, `

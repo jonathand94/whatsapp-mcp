@@ -389,7 +389,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	//
 	// chatNameFor consults the user's address book before falling back to the
 	// push name, so the value written here is already the best one known — which
-	// is what keeps the COALESCE above from overwriting "Mi Amor" with the push
+	// is what keeps the COALESCE above from overwriting "Mi Cielo" with the push
 	// name on the next inbound message. See contacts_sync.go. Its own gate is
 	// the full non-direct surface (group, broadcast, newsletter) via
 	// chatTypeFromJID, not just IsGroup — the same boundary chatTypeFromJID

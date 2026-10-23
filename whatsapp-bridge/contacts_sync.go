@@ -2,9 +2,9 @@
 //
 // The bridge knew every contact by the name that contact chose for themselves
 // (push_name) and by nothing else. That is rarely the name the user thinks in:
-// a partner saved as "Mi Amor" broadcasts "Dra Ivette De La Vega", a plumber
+// a partner saved as "Mi Cielo" broadcasts "Dra Laura De La Rosa", a plumber
 // saved as "Plomero Casa" broadcasts a company slogan. Asking the bridge for
-// "Mi Amor" returned zero results, and the fallback — supply a phone number
+// "Mi Cielo" returned zero results, and the fallback — supply a phone number
 // instead — asks the user to remember the one thing an address book exists so
 // they never have to.
 //

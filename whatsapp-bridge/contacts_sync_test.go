@@ -53,9 +53,9 @@ func TestAddressBookName(t *testing.T) {
 	tests := []struct {
 		full, first, want string
 	}{
-		{"Mi Amor", "Ivette", "Mi Amor"}, // FullName wins
+		{"Mi Cielo", "Laura", "Mi Cielo"}, // FullName wins
 		{"", "Mariana", "Mariana"},       // saved with only a first name
-		{"  Mi Amor  ", "", "Mi Amor"},   // trimmed
+		{"  Mi Cielo  ", "", "Mi Cielo"},   // trimmed
 		{"   ", "Mariana", "Mariana"},    // whitespace-only is not a name
 		{"", "", ""},                     // not in the address book at all
 	}
@@ -73,15 +73,15 @@ func TestWriteContactNameNamesTheChat(t *testing.T) {
 	const jid = "15555550100@s.whatsapp.net"
 	insertChat(t, db, jid, "direct", "")
 
-	renamed, err := writeContactName(t.Context(), db, jid, "Mi Amor", 100)
+	renamed, err := writeContactName(t.Context(), db, jid, "Mi Cielo", 100)
 	if err != nil {
 		t.Fatalf("writeContactName: %v", err)
 	}
 	if renamed != 1 {
 		t.Fatalf("renamed %d chats, want 1", renamed)
 	}
-	if got, ok := chatName(t, db, jid); !ok || got != "Mi Amor" {
-		t.Fatalf("chat name = %q (valid=%v), want Mi Amor", got, ok)
+	if got, ok := chatName(t, db, jid); !ok || got != "Mi Cielo" {
+		t.Fatalf("chat name = %q (valid=%v), want Mi Cielo", got, ok)
 	}
 
 	var full, norm sql.NullString
@@ -89,13 +89,13 @@ func TestWriteContactNameNamesTheChat(t *testing.T) {
 		Scan(&full, &norm); err != nil {
 		t.Fatalf("read contact: %v", err)
 	}
-	if full.String != "Mi Amor" {
+	if full.String != "Mi Cielo" {
 		t.Fatalf("full_name = %q", full.String)
 	}
 	// Without the normalized column, accent-insensitive search reaches
 	// push_name but not the address-book name — the one the user searches by.
-	if norm.String != Normalize("Mi Amor") {
-		t.Fatalf("normalized_full_name = %q, want %q", norm.String, Normalize("Mi Amor"))
+	if norm.String != Normalize("Mi Cielo") {
+		t.Fatalf("normalized_full_name = %q, want %q", norm.String, Normalize("Mi Cielo"))
 	}
 }
 
@@ -115,14 +115,14 @@ func TestWriteContactNameFollowsAliases(t *testing.T) {
 		t.Fatalf("insert aliases: %v", err)
 	}
 
-	renamed, err := writeContactName(t.Context(), db, phoneJID, "Mi Amor", 100)
+	renamed, err := writeContactName(t.Context(), db, phoneJID, "Mi Cielo", 100)
 	if err != nil {
 		t.Fatalf("writeContactName: %v", err)
 	}
 	if renamed != 1 {
 		t.Fatalf("renamed %d chats, want 1 (the alias row)", renamed)
 	}
-	if got, _ := chatName(t, db, lidJID); got != "Mi Amor" {
+	if got, _ := chatName(t, db, lidJID); got != "Mi Cielo" {
 		t.Fatalf("the @lid chat should have been named, got %q", got)
 	}
 }
@@ -133,16 +133,16 @@ func TestWriteContactNameNeverRenamesAGroup(t *testing.T) {
 	// A contact JID should never collide with a group row. This asserts the
 	// guard anyway, because the cost of being wrong is overwriting a group's
 	// subject with one member's name — the exact defect this work started from.
-	insertChat(t, db, jid, "group", "Primos Domínguez")
+	insertChat(t, db, jid, "group", "Primos Hernández")
 
-	renamed, err := writeContactName(t.Context(), db, jid, "Mi Amor", 100)
+	renamed, err := writeContactName(t.Context(), db, jid, "Mi Cielo", 100)
 	if err != nil {
 		t.Fatalf("writeContactName: %v", err)
 	}
 	if renamed != 0 {
 		t.Fatalf("renamed %d group chats, want 0", renamed)
 	}
-	if got, _ := chatName(t, db, jid); got != "Primos Domínguez" {
+	if got, _ := chatName(t, db, jid); got != "Primos Hernández" {
 		t.Fatalf("group subject was overwritten: %q", got)
 	}
 }
@@ -152,7 +152,7 @@ func TestWriteContactNameClearsWhenRemovedFromAddressBook(t *testing.T) {
 	const jid = "15555550100@s.whatsapp.net"
 	insertChat(t, db, jid, "direct", "")
 
-	if _, err := writeContactName(t.Context(), db, jid, "Mi Amor", 100); err != nil {
+	if _, err := writeContactName(t.Context(), db, jid, "Mi Cielo", 100); err != nil {
 		t.Fatalf("first write: %v", err)
 	}
 	// Deleting the contact on the phone arrives as an event with no name. The
@@ -181,7 +181,7 @@ func TestWriteContactNameIsIdempotent(t *testing.T) {
 	// The startup sweep runs on every boot; a second pass must not duplicate
 	// the contact row or fail on the primary key.
 	for i := 0; i < 3; i++ {
-		if _, err := writeContactName(t.Context(), db, jid, "Mi Amor", int64(100+i)); err != nil {
+		if _, err := writeContactName(t.Context(), db, jid, "Mi Cielo", int64(100+i)); err != nil {
 			t.Fatalf("pass %d: %v", i, err)
 		}
 	}
@@ -205,10 +205,10 @@ func TestSearchMatchesTheAddressBookName(t *testing.T) {
 	if _, err := db.Exec(`
 		INSERT INTO contacts (jid, push_name, normalized_name, is_business, created_at, updated_at)
 		VALUES (?, ?, ?, 0, 0, 0)
-	`, jid, "Dra Ivette De La Vega", Normalize("Dra Ivette De La Vega")); err != nil {
+	`, jid, "Dra Laura De La Rosa", Normalize("Dra Laura De La Rosa")); err != nil {
 		t.Fatalf("seed contact: %v", err)
 	}
-	if _, err := writeContactName(t.Context(), db, jid, "Mi Amor", 100); err != nil {
+	if _, err := writeContactName(t.Context(), db, jid, "Mi Cielo", 100); err != nil {
 		t.Fatalf("writeContactName: %v", err)
 	}
 
@@ -227,16 +227,16 @@ func TestSearchMatchesTheAddressBookName(t *testing.T) {
 		return n
 	}
 
-	if got := search("Mi Amor"); got != 1 {
+	if got := search("Mi Cielo"); got != 1 {
 		t.Fatalf("searching the address-book name returned %d, want 1", got)
 	}
 	// The self-chosen name must keep working; this adds a way in, it does not
 	// replace one.
-	if got := search("Ivette"); got != 1 {
+	if got := search("Laura"); got != 1 {
 		t.Fatalf("searching the push name returned %d, want 1", got)
 	}
 	// Accent- and case-insensitively, same as every other name search.
-	if got := search("mi amor"); got != 1 {
+	if got := search("mi cielo"); got != 1 {
 		t.Fatalf("case-insensitive search returned %d, want 1", got)
 	}
 }

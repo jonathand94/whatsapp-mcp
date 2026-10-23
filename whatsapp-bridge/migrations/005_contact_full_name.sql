@@ -2,11 +2,11 @@
 --
 -- Background: contacts.push_name is what a contact set for THEMSELVES. It is
 -- not what the user calls them, and on a real account the two diverge
--- constantly: a partner saved as "Mi Amor" broadcasts "Dra Ivette De La Vega".
+-- constantly: a partner saved as "Mi Cielo" broadcasts "Dra Laura De La Rosa".
 -- The bridge only ever had somewhere to put the second one.
 --
 -- The consequences were not cosmetic. search_contacts could not find anyone by
--- the only name the user actually knows, so looking up "Mi Amor" returned zero
+-- the only name the user actually knows, so looking up "Mi Cielo" returned zero
 -- and the user had to supply a phone number instead — and got it wrong the
 -- first time, because remembering a number is exactly what an address book
 -- exists to avoid.
@@ -24,7 +24,7 @@
 -- all no matter how many messages arrived.
 --
 -- normalized_full_name mirrors the existing normalized_name so accent-
--- insensitive search reaches the address-book name too: without it, "Mi Amor"
+-- insensitive search reaches the address-book name too: without it, "Mi Cielo"
 -- would be findable but "José" would not match "jose", which is the behaviour
 -- normalize.go exists to prevent.
 --

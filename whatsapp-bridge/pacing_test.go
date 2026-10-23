@@ -13,7 +13,7 @@ import (
 func TestSpacingStopsARunawayLoop(t *testing.T) {
 	g := newSendGovernor(defaultSendLimits())
 	now := time.Now()
-	const chat = "5214423647337@s.whatsapp.net"
+	const chat = "5215550647337@s.whatsapp.net"
 
 	if d := g.Authorize(chat, false, now); !d.Allow {
 		t.Fatalf("first send refused: %s", d.Reason)
@@ -63,7 +63,7 @@ func TestNewChatLimitIsTheOneThatMatters(t *testing.T) {
 	// Meanwhile existing conversations are untouched: being at the stranger
 	// limit must not break replying to the people who did write first.
 	at := base.Add(41 * time.Minute)
-	if d := g.Authorize("5214423227630@s.whatsapp.net", false, at); !d.Allow {
+	if d := g.Authorize("5215550227630@s.whatsapp.net", false, at); !d.Allow {
 		t.Fatalf("an established chat was refused because of the new-chat limit: %s", d.Reason)
 	}
 }
@@ -75,7 +75,7 @@ func TestNewChatLimitIsTheOneThatMatters(t *testing.T) {
 func TestRefusalCostsNothing(t *testing.T) {
 	g := newSendGovernor(defaultSendLimits())
 	now := time.Now()
-	const chat = "5214423647337@s.whatsapp.net"
+	const chat = "5215550647337@s.whatsapp.net"
 
 	g.Authorize(chat, false, now) // one real send
 	for i := 0; i < 100; i++ {

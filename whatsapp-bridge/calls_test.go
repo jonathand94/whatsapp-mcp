@@ -284,7 +284,7 @@ func TestListCallsEndpoint(t *testing.T) {
 	db := newCallsTestDB(t)
 	ctx := context.Background()
 	seedChat(t, db, callerPN.String(), "direct", "")
-	if _, err := db.Exec(`INSERT INTO contacts (jid, full_name, created_at, updated_at) VALUES (?, 'Mi Amor', 1, 1)`,
+	if _, err := db.Exec(`INSERT INTO contacts (jid, full_name, created_at, updated_at) VALUES (?, 'Mi Cielo', 1, 1)`,
 		callerPN.String()); err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +325,7 @@ func TestListCallsEndpoint(t *testing.T) {
 	if len(all) != 3 || all[0].ID != "c-spam" || all[2].ID != "c-old" {
 		t.Fatalf("want 3 calls newest first, got %+v", all)
 	}
-	if all[1].CallerName != "Mi Amor" {
+	if all[1].CallerName != "Mi Cielo" {
 		t.Errorf("a call from the @lid form should resolve to the address-book name, got %q", all[1].CallerName)
 	}
 	if all[0].CallerName != "" {
